@@ -1,87 +1,304 @@
-export type ConfigurationUseContext = 'embeddings' | 'keyword' | 'none' | 'blended' | 'unified'
+import type { ClientCapabilitiesWithLegacyFields } from './configuration/clientCapabilities'
+import type { ChatModelProviderConfig } from './models/sync'
+
+import type { PromptString } from './prompt/prompt-string'
+import type { ReadonlyDeep } from './utils'
 
 /**
- * Get the numeric ID corresponding to the ConfigurationUseContext mode.
+ * Represents the source of an authentication token generation, either a redirect or paste flow.
+ * A redirect flow is initiated by the user clicking a link in the browser, while a paste flow is initiated by the user
+ * manually entering the access from into the VsCode App.
  */
-export const CONTEXT_SELECTION_ID: Record<ConfigurationUseContext, number> = {
-    none: 0,
-    embeddings: 1,
-    keyword: 2,
-    blended: 10,
-    unified: 11,
+export type TokenSource = 'redirect' | 'paste'
+
+/**
+ * The user's authentication credentials, which are stored separately from the rest of the
+ * configuration.
+ */
+export interface AuthCredentials {
+    serverEndpoint: string
+    accessToken: string | null
+    tokenSource?: TokenSource | undefined
 }
 
-// Should we share VS Code specific config via cody-shared?
-export interface Configuration {
-    proxy?: string | null
+export interface AutoEditsTokenLimit {
+    prefixTokens: number
+    suffixTokens: number
+    maxPrefixLinesInArea: number
+    maxSuffixLinesInArea: number
+    codeToRewritePrefixLines: number
+    codeToRewriteSuffixLines: number
+    contextSpecificTokenLimit: Record<string, number>
+}
+
+/**
+ * Configuration for the auto-edit model provider.
+ * Used to configure the model provider for auto-edit functionality in the VS Code extension.
+ */
+export interface AutoEditsModelConfig {
+    /** The provider service to use for auto-edit. Can be 'openai', 'fireworks', 'cody-gateway', or 'sourcegraph' */
+    provider: 'openai' | 'fireworks' | 'cody-gateway' | 'sourcegraph'
+    /** The specific model identifier to use for auto-edit */
+    model: string
+    /** The endpoint URL for the provider's API */
+    url: string
+    /** API key for authentication with the provider */
+    apiKey: string
+    /** Token limits configuration for the model's context window */
+    tokenLimit: AutoEditsTokenLimit
+    /** Whether the model is a chat-based model (true) or completions model (false)
+     *  Depending on this variable:
+     *   - The request is directed either to chat or completions endpoint
+     *   - The prompt is formatted accordingly
+     */
+    isChatModel: boolean
+}
+
+export interface NetConfiguration {
+    mode?: string | undefined | null
+    proxy?: {
+        endpoint?: string | undefined | null
+        cacert?: string | undefined | null
+        skipCertValidation?: boolean | undefined | null
+    }
+    vscode?: string | undefined | null
+}
+
+export interface AgenticContextConfiguration {
+    shell?: {
+        allow?: string[] | undefined | null
+        block?: string[] | undefined | null
+    }
+}
+
+interface RawClientConfiguration {
+    net: NetConfiguration
     codebase?: string
-    debugEnable: boolean
     debugFilter: RegExp | null
     debugVerbose: boolean
     telemetryLevel: 'all' | 'off' | 'agent'
-    useContext: ConfigurationUseContext
-    customHeaders: Record<string, string>
-    chatPreInstruction: string
+
+    serverEndpoint?: string
+    customHeaders?: Record<string, string>
+    chatPreInstruction?: PromptString
+    editPreInstruction?: PromptString
     codeActions: boolean
     commandHints: boolean
     commandCodeLenses: boolean
-    editorTitleCommandIcon: boolean
 
-    /**
-     * Autocomplete
-     */
+    // Deep Cody
+    agenticContextExperimentalOptions?: AgenticContextConfiguration
+
+    //#region Autocomplete
     autocomplete: boolean
     autocompleteLanguages: Record<string, boolean>
-    autocompleteAdvancedProvider: 'anthropic' | 'fireworks' | 'unstable-openai' | null
-    autocompleteAdvancedModel: string | null
+    autocompleteAdvancedProvider: AutocompleteProviderID | string
     autocompleteCompleteSuggestWidgetSelection?: boolean
     autocompleteFormatOnAccept?: boolean
+    autocompleteDisableInsideComments: boolean
 
-    /**
-     * Experimental
-     */
-    experimentalGuardrails: boolean
-    experimentalSymfContext: boolean
-    experimentalTracing: boolean
-    experimentalSimpleChatContext: boolean
-
-    /**
-     * Unstable Features for internal testing only
-     */
-    internalUnstable: boolean
-
-    /**
-     * Experimental autocomplete
-     */
-    autocompleteExperimentalSyntacticPostProcessing?: boolean
-    autocompleteExperimentalDynamicMultilineCompletions?: boolean
-    autocompleteExperimentalHotStreak?: boolean
-    autocompleteExperimentalFastPath?: boolean
-    autocompleteExperimentalGraphContext: 'bfg' | 'bfg-mixed' | null
+    //#region Experimental
+    autocompleteExperimentalGraphContext: 'lsp-light' | 'tsc' | 'tsc-mixed' | null
     autocompleteExperimentalOllamaOptions: OllamaOptions
+    autocompleteExperimentalFireworksOptions?: ExperimentalFireworksConfig
+
+    experimentalTracing: boolean
+    experimentalSupercompletions: boolean
+    experimentalAutoEditRendererTesting: boolean
+    experimentalAutoEditConfigOverride: AutoEditsModelConfig | undefined
+    experimentalAutoEditEnabled: boolean
+    experimentalCommitMessage: boolean
+    experimentalNoodle: boolean
+    experimentalMinionAnthropicKey: string | undefined
+    experimentalNoxideEnabled: boolean
+    experimentalGuardrailsTimeoutSeconds: number | undefined
+
+    //#region Unstable
+    internalUnstable: boolean
+    internalDebugContext?: boolean
+    internalDebugState?: boolean
+
+    //#region Hidden Settings
+    hasNativeWebview: boolean
+    isRunningInsideAgent?: boolean
 
     /**
-     * Hidden settings
+     * @deprecated Do not use directly. Call {@link clientCapabilities} instead
+     * (`clientCapabilities().agentIDE`) and see the docstring on
+     * {@link ClientCapabilitiesWithLegacyFields.agentIDE}.
      */
-    isRunningInsideAgent?: boolean
-    agentIDE?: 'VSCode' | 'JetBrains' | 'Neovim' | 'Emacs'
-    autocompleteTimeouts: AutocompleteTimeouts
+    agentIDE?: CodyIDE
 
-    testingLocalEmbeddingsModel: string | undefined
-    testingLocalEmbeddingsEndpoint: string | undefined
-    testingLocalEmbeddingsIndexLibraryPath: string | undefined
+    /**
+     * @deprecated Do not use directly. Call {@link clientCapabilities} instead
+     * (`clientCapabilities().agentIDEVersion`) and see the docstring on
+     * {@link ClientCapabilitiesWithLegacyFields.agentIDEVersion}.
+     */
+    agentIDEVersion?: ClientCapabilitiesWithLegacyFields['agentIDEVersion']
+
+    /**
+     * @deprecated Do not use directly. Call {@link clientCapabilities} instead
+     * (`clientCapabilities().agentExtensionVersion`) and see the docstring on
+     * {@link ClientCapabilitiesWithLegacyFields.agentExtensionVersion}.
+     */
+    agentExtensionVersion?: ClientCapabilitiesWithLegacyFields['agentExtensionVersion']
+
+    /**
+     * @deprecated Do not use directly. Call {@link clientCapabilities} instead
+     * (`clientCapabilities().agentIDEVersion`) and see the docstring on
+     * {@link ClientCapabilitiesWithLegacyFields.agentIDEVersion}.
+     */
+    telemetryClientName?: string
+
+    agentHasPersistentStorage?: boolean
+    autocompleteFirstCompletionTimeout: number
+    autocompleteAdvancedModel: string | null
+    providerLimitPrompt?: number
+    devModels?: ChatModelProviderConfig[]
+
+    //#region Forced Overrides
+    /**
+     * Overrides always take precedence over other configuration. Specific
+     * override flags should be preferred over opaque broad settings /
+     * environment variables such as TESTING_MODE which can make it difficult to
+     * understand the broad implications such a setting can have.
+     */
+    overrideServerEndpoint?: string | undefined
+    overrideAuthToken?: string | undefined
 }
 
-export interface AutocompleteTimeouts {
-    multiline?: number
-    singleline?: number
+/**
+ * Client configuration, such as VS Code settings.
+ */
+export type ClientConfiguration = ReadonlyDeep<RawClientConfiguration>
+
+export enum CodyIDE {
+    VSCode = 'VSCode',
+    JetBrains = 'JetBrains',
+    Neovim = 'Neovim',
+    Emacs = 'Emacs',
+    Web = 'Web',
+    VisualStudio = 'VisualStudio',
+    Eclipse = 'Eclipse',
+
+    /**
+     * The standalone web client in the Cody repository's `web/` tree.
+     */
+    StandaloneWeb = 'StandaloneWeb',
 }
 
-export interface ConfigurationWithAccessToken extends Configuration {
-    serverEndpoint: string
-    /** The access token, which is stored in the secret storage (not configuration). */
-    accessToken: string | null
+/**
+ * These values must match the enum values in cody.suggestions.mode in vscode/package.json
+ */
+export enum CodyAutoSuggestionMode {
+    /**
+     * The suggestion mode where suggestions come from the OpenAI completions API. This is the default mode.
+     */
+    Autocomplete = 'autocomplete',
+    /**
+     * The suggestion mode where suggestions come from the Cody AI agent chat API.
+     */
+    Autoedit = 'auto-edit (Experimental)',
+    /**
+     * Disable Cody suggestions altogether.
+     */
+    Off = 'off',
 }
+
+export type AutocompleteProviderID = keyof typeof AUTOCOMPLETE_PROVIDER_ID
+
+export const AUTOCOMPLETE_PROVIDER_ID = {
+    /**
+     * Default identifier that maps to the recommended autocomplete provider on DotCom.
+     */
+    default: 'default',
+
+    /**
+     * Cody talking to Fireworks official API.
+     * https://docs.fireworks.ai/api-reference/introduction
+     */
+    fireworks: 'fireworks',
+
+    /**
+     * Cody talking to openai compatible API.
+     * We plan to use this provider instead of all the existing openai-related providers.
+     */
+    openaicompatible: 'openaicompatible',
+
+    /**
+     * Cody talking to OpenAI's official public API.
+     * https://platform.openai.com/docs/api-reference/introduction
+     */
+    openai: 'openai',
+
+    /**
+     * Cody talking to OpenAI's official public API.
+     * https://platform.openai.com/docs/api-reference/introduction
+     *
+     * @deprecated use `openai` instead
+     */
+    'unstable-openai': 'unstable-openai',
+
+    /**
+     * Cody talking to OpenAI through Microsoft Azure's API (they re-sell the OpenAI API, but slightly modified).
+     *
+     * @deprecated use `openai` instead
+     */
+    'azure-openai': 'azure-openai',
+
+    /**
+     * This refers to either Anthropic models re-sold by AWS,
+     * or to other models hosted by AWS' Bedrock inference API service
+     */
+    'aws-bedrock': 'aws-bedrock',
+
+    /**
+     * Cody talking to Anthropic's official public API.
+     * https://docs.anthropic.com/en/api/getting-started
+     */
+    anthropic: 'anthropic',
+
+    /**
+     * Cody talking to Google's APIs for models created by Google, which include:
+     * - their public Gemini API
+     * - their GCP Gemini API
+     * - GCP Vertex API
+     * - Anthropic-reselling APIs
+     */
+    google: 'google',
+
+    /**
+     * Cody talking to Google's APIs for models created by Google, which include:
+     * - their public Gemini API
+     * - their GCP Gemini API
+     * - GCP Vertex API
+     */
+    gemini: 'gemini',
+
+    /**
+     * Cody talking to Google's APIs for models created by Google, which include:
+     * - their public Gemini API
+     * - their GCP Gemini API
+     * - GCP Vertex API
+     *
+     * @deprecated use `gemini` instead.
+     */
+    'unstable-gemini': 'unstable-gemini',
+
+    /**
+     * Cody talking to Ollama's official public API.
+     * https://ollama.ai/docs/api
+     */
+    'experimental-ollama': 'experimental-ollama',
+
+    /**
+     * Cody talking to Ollama's official public API.
+     * https://ollama.ai/docs/api
+     *
+     * @deprecated use `experimental-ollama` instead.
+     */
+    'unstable-ollama': 'unstable-ollama',
+} as const
 
 export interface OllamaOptions {
     /**
@@ -207,4 +424,79 @@ export interface OllamaGenerateParameters {
      * (default: 1)
      */
     tfs_z?: number
+}
+
+export interface ExperimentalFireworksConfig {
+    url: string
+    token: string
+    model: string
+    parameters?: FireworksCodeCompletionParams
+}
+
+/**
+ * @see https://console.groq.com/docs/text-chat
+ */
+export interface GroqCompletionOptions {
+    /**
+     *An optional name to disambiguate messages from different users with the same role.
+     */
+    name?: string
+    /**
+     *Seed used for sampling. Groq attempts to return the same response to the same request with an identical seed.
+     */
+    seed?: number
+    /**
+     *The maximum number of tokens that the model can process in a single response. This limits ensures computational efficiency and resource management.
+     */
+    max_tokens?: number
+    /**
+     *A method of text generation where a model will only consider the most probable next tokens that make up the probability p. 0.5 means half of all likelihood-weighted options are considered.
+     */
+    top_p?: number
+    /**
+     *Controls randomness of responses. A lower temperature leads to more predictable outputs while a higher temperature results in more varies and sometimes more creative outputs.
+     */
+    temperature?: number
+    /**
+     *User server-side events to send the completion in small deltas rather than in a single batch after all processing has finished. This reduces the time to first token received.
+     */
+    stream?: boolean
+    /**
+     *A stop sequence is a predefined or user-specified text string that signals an AI to stop generating content, ensuring its responses remain focused and concise.
+     */
+    stop?: string[]
+}
+
+export interface FireworksCodeCompletionParams {
+    model: string | undefined
+    prompt: string
+    max_tokens: number
+    echo: boolean
+    temperature: number | undefined
+    top_p: number | undefined
+    top_k: number | undefined
+    stop: string[]
+    stream: boolean
+    languageId: string
+    user: string | null
+}
+
+export interface AgentToolboxSettings {
+    /**
+     * The agent that user has currently enabled.
+     */
+    agent?: {
+        /**
+         * The name of the agent that user has currently enabled. E.g. "deep-cody"
+         */
+        name?: string
+    }
+    /**
+     * Whether the user has enabled terminal context.
+     * Defaulted to undefined if shell context is not enabled by site admin via feature flag.
+     */
+    shell?: {
+        enabled: boolean
+        error?: string
+    }
 }

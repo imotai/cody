@@ -1,87 +1,45 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-
-import './App.css'
+import { type ComponentProps, useCallback, useEffect, useMemo, useState } from 'react'
 
 import {
-    GuardrailsPost,
-    type ChatHistory,
-    type ChatInputHistory,
     type ChatMessage,
-    type ModelProvider,
-    type Configuration,
-    type ContextFile,
-    type EnhancedContextContextT,
+    type CodyClientConfig,
+    type DefaultContext,
+    GuardrailsPost,
+    PromptString,
+    type TelemetryRecorder,
+    getAuthErrorMessage,
 } from '@sourcegraph/cody-shared'
-import type { UserAccountInfo } from '@sourcegraph/cody-ui/src/Chat'
-import { EnhancedContextEnabled } from '@sourcegraph/cody-ui/src/chat/components/EnhancedContext'
-
-import type { AuthMethod, AuthStatus, LocalEnv } from '../src/chat/protocol'
-import { trailingNonAlphaNumericRegex } from '../src/commands/utils/test-commands'
-
-import { Chat } from './Chat'
-import {
-    EnhancedContextContext,
-    EnhancedContextEventHandlers,
-} from './Components/EnhancedContextSettings'
+import type { AuthMethod } from '../src/chat/protocol'
+import styles from './App.module.css'
+import { AuthPage } from './AuthPage'
 import { LoadingPage } from './LoadingPage'
-import type { View } from './NavBar'
-import { Notices } from './Notices'
-import { LoginSimplified } from './OnboardingExperiment'
-import { updateDisplayPathEnvInfoForWebview } from './utils/displayPathEnvInfo'
-import { createWebviewTelemetryService } from './utils/telemetry'
+import { useClientActionDispatcher } from './client/clientState'
+import { WebviewOpenTelemetryService } from './utils/webviewOpenTelemetryService'
+
+import { ExtensionAPIProviderFromVSCodeAPI } from '@sourcegraph/prompt-editor'
+import { CodyPanel } from './CodyPanel'
+import { AuthenticationErrorBanner } from './components/AuthenticationErrorBanner'
+import { useSuppressKeys } from './components/hooks'
+import { View } from './tabs'
 import type { VSCodeWrapper } from './utils/VSCodeApi'
+import { ComposedWrappers, type Wrapper } from './utils/composeWrappers'
+import { updateDisplayPathEnvInfoForWebview } from './utils/displayPathEnvInfo'
+import { TelemetryRecorderContext, createWebviewTelemetryRecorder } from './utils/telemetry'
+import { ClientConfigProvider } from './utils/useClientConfig'
+import { type Config, ConfigProvider } from './utils/useConfig'
 
 export const App: React.FunctionComponent<{ vscodeAPI: VSCodeWrapper }> = ({ vscodeAPI }) => {
-    const [config, setConfig] = useState<
-        (Pick<Configuration, 'debugEnable' | 'experimentalGuardrails'> & LocalEnv) | null
-    >(null)
-    const [view, setView] = useState<View | undefined>()
-    // If the current webview is active (vs user is working in another editor tab)
-    const [isWebviewActive, setIsWebviewActive] = useState<boolean>(true)
+    const [config, setConfig] = useState<Config | null>(null)
+    const [clientConfig, setClientConfig] = useState<CodyClientConfig | null>(null)
+    // NOTE: View state will be set by the extension host during initialization.
+    const [view, setView] = useState<View>()
     const [messageInProgress, setMessageInProgress] = useState<ChatMessage | null>(null)
-    const [messageBeingEdited, setMessageBeingEdited] = useState<number | undefined>(undefined)
+
     const [transcript, setTranscript] = useState<ChatMessage[]>([])
 
-    const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null)
-    const [userAccountInfo, setUserAccountInfo] = useState<UserAccountInfo>({
-        isDotComUser: true,
-        isCodyProUser: false,
-    })
-
-    const [formInput, setFormInput] = useState('')
-    const [inputHistory, setInputHistory] = useState<ChatInputHistory[]>([])
-    const [userHistory, setUserHistory] = useState<ChatHistory | null>(null)
-    const [chatIDHistory, setChatIDHistory] = useState<string[]>([])
-
-    const [contextSelection, setContextSelection] = useState<ContextFile[] | null>(null)
-
     const [errorMessages, setErrorMessages] = useState<string[]>([])
-    const [isTranscriptError, setIsTranscriptError] = useState<boolean>(false)
 
-    const [chatModels, setChatModels] = useState<ModelProvider[]>()
-
-    const [chatEnabled, setChatEnabled] = useState<boolean>(true)
-    const [attributionEnabled, setAttributionEnabled] = useState<boolean>(false)
-
-    const [enhancedContextEnabled, setEnhancedContextEnabled] = useState<boolean>(true)
-    const [enhancedContextStatus, setEnhancedContextStatus] = useState<EnhancedContextContextT>({
-        groups: [],
-    })
-    const onChooseRemoteSearchRepo = useCallback((): void => {
-        vscodeAPI.postMessage({ command: 'context/choose-remote-search-repo' })
-    }, [vscodeAPI])
-    const onRemoveRemoteSearchRepo = useCallback(
-        (id: string): void => {
-            vscodeAPI.postMessage({ command: 'context/remove-remote-search-repo', repoId: id })
-        },
-        [vscodeAPI]
-    )
-    const onConsentToEmbeddings = useCallback((): void => {
-        vscodeAPI.postMessage({ command: 'embeddings/index' })
-    }, [vscodeAPI])
-    const onShouldBuildSymfIndex = useCallback((): void => {
-        vscodeAPI.postMessage({ command: 'symf/index' })
-    }, [vscodeAPI])
+    const dispatchClientAction = useClientActionDispatcher()
 
     const guardrails = useMemo(() => {
         return new GuardrailsPost((snippet: string) => {
@@ -92,69 +50,56 @@ export const App: React.FunctionComponent<{ vscodeAPI: VSCodeWrapper }> = ({ vsc
         })
     }, [vscodeAPI])
 
-    // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally refresh on `view`
+    useSuppressKeys()
+
     useEffect(
         () =>
             vscodeAPI.onMessage(message => {
                 switch (message.type) {
+                    case 'ui/theme': {
+                        document.documentElement.dataset.ide = message.agentIDE
+                        const rootStyle = document.documentElement.style
+                        for (const [name, value] of Object.entries(message.cssVariables || {})) {
+                            rootStyle.setProperty(name, value)
+                        }
+                        break
+                    }
                     case 'transcript': {
+                        const deserializedMessages = message.messages.map(
+                            PromptString.unsafe_deserializeChatMessage
+                        )
                         if (message.isMessageInProgress) {
-                            const msgLength = message.messages.length - 1
-                            setTranscript(message.messages.slice(0, msgLength))
-                            setMessageInProgress(message.messages[msgLength])
-                            setIsTranscriptError(false)
+                            const msgLength = deserializedMessages.length - 1
+                            setTranscript(deserializedMessages.slice(0, msgLength))
+                            setMessageInProgress(deserializedMessages[msgLength])
                         } else {
-                            setTranscript(message.messages)
+                            setTranscript(deserializedMessages)
                             setMessageInProgress(null)
                         }
-                        setChatIDHistory([...chatIDHistory, message.chatID])
                         vscodeAPI.setState(message.chatID)
                         break
                     }
                     case 'config':
-                        setConfig(message.config)
-                        setAuthStatus(message.authStatus)
-                        setUserAccountInfo({
-                            isCodyProUser: !message.authStatus.userCanUpgrade,
-                            // Receive this value from the extension backend to make it work
-                            // with E2E tests where change the DOTCOM_URL via the env variable TESTING_DOTCOM_URL.
-                            isDotComUser: message.authStatus.isDotCom,
-                        })
-                        setView(message.authStatus.isLoggedIn ? 'chat' : 'login')
+                        setConfig(message)
                         updateDisplayPathEnvInfoForWebview(message.workspaceFolderUris)
-                        // Get chat models
-                        if (message.authStatus.isLoggedIn) {
-                            vscodeAPI.postMessage({ command: 'get-chat-models' })
+                        // Reset to the default view (Chat) for unauthenticated users.
+                        if (view && view !== View.Chat && !message.authStatus?.authenticated) {
+                            setView(View.Chat)
                         }
                         break
-                    case 'setConfigFeatures':
-                        setChatEnabled(message.configFeatures.chat)
-                        setAttributionEnabled(message.configFeatures.attribution)
+                    case 'clientConfig':
+                        if (message.clientConfig) {
+                            setClientConfig(message.clientConfig)
+                        }
                         break
-                    case 'history':
-                        setInputHistory(message.messages?.input ?? [])
-                        setUserHistory(message.messages?.chat ?? null)
-                        break
-                    case 'enhanced-context':
-                        setEnhancedContextStatus(message.context)
-                        break
-                    case 'userContextFiles':
-                        setContextSelection(message.context)
+                    case 'clientAction':
+                        dispatchClientAction(message)
                         break
                     case 'errors':
-                        setErrorMessages([...errorMessages, message.errors].slice(-5))
+                        setErrorMessages(prev => [...prev, message.errors].slice(-5))
                         break
                     case 'view':
-                        setView(message.messages)
-                        break
-                    case 'webview-state':
-                        setIsWebviewActive(message.isActive)
-                        break
-                    case 'transcript-errors':
-                        setIsTranscriptError(message.isTranscriptError)
-                        break
-                    case 'chatModels':
-                        setChatModels(message.models)
+                        setView(message.view)
                         break
                     case 'attribution':
                         if (message.attribution) {
@@ -174,7 +119,7 @@ export const App: React.FunctionComponent<{ vscodeAPI: VSCodeWrapper }> = ({ vsc
                         break
                 }
             }),
-        [errorMessages, view, vscodeAPI, guardrails]
+        [view, vscodeAPI, guardrails, dispatchClientAction]
     )
 
     useEffect(() => {
@@ -185,158 +130,124 @@ export const App: React.FunctionComponent<{ vscodeAPI: VSCodeWrapper }> = ({ vsc
     useEffect(() => {
         if (!view) {
             vscodeAPI.postMessage({ command: 'initialized' })
+            return
         }
     }, [view, vscodeAPI])
-
-    useEffect(() => {
-        if (formInput.endsWith(' ')) {
-            setContextSelection(null)
-        }
-
-        // TODO(toolmantim): Allow using @ mid-message by using cursor position not endsWith
-
-        // Regex to check if input ends with the '@' tag format, always get the last @tag
-        // pass: 'foo @bar.ts', '@bar.ts', '@foo.ts @bar', '@'
-        // fail: 'foo ', '@foo.ts bar', '@ foo.ts', '@foo.ts '
-        const addFileRegex = /@\S+$/
-        // Get the string after the last '@' symbol
-        const addFileInput = formInput.match(addFileRegex)?.[0]
-
-        if (
-            !formInput.endsWith('@') &&
-            !formInput.endsWith('.') &&
-            trailingNonAlphaNumericRegex.test(formInput) &&
-            !contextSelection?.length
-        ) {
-            setContextSelection(null)
-            return
-        }
-
-        if (formInput.endsWith('@') || addFileInput) {
-            const query = addFileInput?.slice(1) || ''
-            vscodeAPI.postMessage({ command: 'getUserContext', query })
-            return
-        }
-
-        setContextSelection(null)
-    }, [formInput, contextSelection?.length, vscodeAPI])
 
     const loginRedirect = useCallback(
         (method: AuthMethod) => {
             // We do not change the view here. We want to keep presenting the
             // login buttons until we get a token so users don't get stuck if
             // they close the browser during an auth flow.
-            vscodeAPI.postMessage({ command: 'auth', type: 'simplified-onboarding', authMethod: method })
+            vscodeAPI.postMessage({
+                command: 'auth',
+                authKind: 'simplified-onboarding',
+                authMethod: method,
+            })
         },
         [vscodeAPI]
     )
 
-    const telemetryService = useMemo(() => createWebviewTelemetryService(vscodeAPI), [vscodeAPI])
+    // V2 telemetry recorder
+    const telemetryRecorder = useMemo(() => createWebviewTelemetryRecorder(vscodeAPI), [vscodeAPI])
 
-    if (!view || !authStatus || !config) {
+    const webviewTelemetryService = useMemo(() => {
+        const service = WebviewOpenTelemetryService.getInstance()
+        return service
+    }, [])
+
+    useEffect(() => {
+        if (config) {
+            webviewTelemetryService.configure({
+                isTracingEnabled: true,
+                debugVerbose: true,
+                agentIDE: config.clientCapabilities.agentIDE,
+                extensionAgentVersion: config.clientCapabilities.agentExtensionVersion,
+            })
+        }
+    }, [config, webviewTelemetryService])
+
+    const wrappers = useMemo<Wrapper[]>(
+        () => getAppWrappers({ vscodeAPI, telemetryRecorder, config, clientConfig }),
+        [vscodeAPI, telemetryRecorder, config, clientConfig]
+    )
+
+    // Wait for all the data to be loaded before rendering Chat View
+    if (!view || !config) {
         return <LoadingPage />
     }
 
     return (
-        <div className="outer-container">
-            {view === 'login' || !authStatus.isLoggedIn ? (
-                <LoginSimplified
-                    simplifiedLoginRedirect={loginRedirect}
-                    telemetryService={telemetryService}
-                    uiKindIsWeb={config?.uiKindIsWeb}
-                    vscodeAPI={vscodeAPI}
-                />
-            ) : (
-                <>
-                    <Notices
-                        probablyNewInstall={!!userHistory && Object.entries(userHistory).length === 0}
+        <ComposedWrappers wrappers={wrappers}>
+            {view === View.Login || !config.authStatus.authenticated ? (
+                <div className={styles.outerContainer}>
+                    {!config.authStatus.authenticated && config.authStatus.error && (
+                        <AuthenticationErrorBanner
+                            errorMessage={getAuthErrorMessage(config.authStatus.error)}
+                        />
+                    )}
+                    <AuthPage
+                        simplifiedLoginRedirect={loginRedirect}
+                        uiKindIsWeb={config.config.uiKindIsWeb}
+                        vscodeAPI={vscodeAPI}
+                        codyIDE={config.clientCapabilities.agentIDE}
+                        endpoints={config.config.endpointHistory ?? []}
+                        authStatus={config.authStatus}
+                        allowEndpointChange={config.config.allowEndpointChange}
                     />
-                    {errorMessages && (
-                        <ErrorBanner errors={errorMessages} setErrors={setErrorMessages} />
-                    )}
-                    {view === 'chat' && (
-                        <EnhancedContextEventHandlers.Provider
-                            value={{
-                                onChooseRemoteSearchRepo,
-                                onConsentToEmbeddings,
-                                onEnabledChange: (enabled): void => {
-                                    if (enabled !== enhancedContextEnabled) {
-                                        setEnhancedContextEnabled(enabled)
-                                    }
-                                },
-                                onRemoveRemoteSearchRepo,
-                                onShouldBuildSymfIndex,
-                            }}
-                        >
-                            <EnhancedContextContext.Provider value={enhancedContextStatus}>
-                                <EnhancedContextEnabled.Provider value={enhancedContextEnabled}>
-                                    <Chat
-                                        chatEnabled={chatEnabled}
-                                        userInfo={userAccountInfo}
-                                        messageInProgress={messageInProgress}
-                                        messageBeingEdited={messageBeingEdited}
-                                        setMessageBeingEdited={setMessageBeingEdited}
-                                        transcript={transcript}
-                                        contextSelection={contextSelection}
-                                        formInput={formInput}
-                                        setFormInput={setFormInput}
-                                        inputHistory={inputHistory}
-                                        setInputHistory={setInputHistory}
-                                        vscodeAPI={vscodeAPI}
-                                        telemetryService={telemetryService}
-                                        isTranscriptError={isTranscriptError}
-                                        chatModels={chatModels}
-                                        setChatModels={setChatModels}
-                                        welcomeMessage={getWelcomeMessageByOS(config?.os)}
-                                        guardrails={
-                                            config.experimentalGuardrails && attributionEnabled
-                                                ? guardrails
-                                                : undefined
-                                        }
-                                        chatIDHistory={chatIDHistory}
-                                        isWebviewActive={isWebviewActive}
-                                    />
-                                </EnhancedContextEnabled.Provider>
-                            </EnhancedContextContext.Provider>
-                        </EnhancedContextEventHandlers.Provider>
-                    )}
-                </>
+                </div>
+            ) : (
+                <CodyPanel
+                    view={view}
+                    setView={setView}
+                    configuration={config}
+                    errorMessages={errorMessages}
+                    setErrorMessages={setErrorMessages}
+                    attributionEnabled={clientConfig?.attributionEnabled ?? false}
+                    chatEnabled={clientConfig?.chatEnabled ?? true}
+                    instanceNotices={clientConfig?.notices ?? []}
+                    messageInProgress={messageInProgress}
+                    transcript={transcript}
+                    vscodeAPI={vscodeAPI}
+                    guardrails={guardrails}
+                    smartApplyEnabled={config.config.smartApply}
+                />
             )}
-        </div>
+        </ComposedWrappers>
     )
 }
 
-const ErrorBanner: React.FunctionComponent<{ errors: string[]; setErrors: (errors: string[]) => void }> =
-    ({ errors, setErrors }) => (
-        <div className="error-container">
-            {errors.map((error, i) => (
-                // biome-ignore lint/suspicious/noArrayIndexKey: error strings might not be unique, so we have no natural id
-                <div key={i} className="error">
-                    <span>{error}</span>
-                    <button
-                        type="button"
-                        className="close-btn"
-                        onClick={() => setErrors(errors.filter(e => e !== error))}
-                    >
-                        ×
-                    </button>
-                </div>
-            ))}
-        </div>
-    )
+interface GetAppWrappersOptions {
+    vscodeAPI: VSCodeWrapper
+    telemetryRecorder: TelemetryRecorder
+    config: Config | null
+    clientConfig: CodyClientConfig | null
+    staticDefaultContext?: DefaultContext
+}
 
-function getWelcomeMessageByOS(os: string): string {
-    const welcomeMessageMarkdown = `Welcome to Cody! Start writing code and Cody will autocomplete lines and entire functions for you.
-
-To run [Cody Commands](command:cody.menu.commands) use the keyboard shortcut <span class="keyboard-shortcut"><span>${
-        os === 'darwin' ? '⌥' : 'Alt'
-    }</span><span>C</span></span>, the <span class="cody-icons">A</span> button, or right-click anywhere in your code.
-
-You can start a new chat at any time with <span class="keyboard-shortcut"><span>${
-        os === 'darwin' ? '⌥' : 'Alt'
-    }</span><span>/</span></span> or using the <span class="cody-icons">H</span> button.
-
-For more tips and tricks, see the [Getting Started Guide](command:cody.welcome) and [docs](https://sourcegraph.com/docs/cody).
-`
-    return welcomeMessageMarkdown
+export function getAppWrappers({
+    vscodeAPI,
+    telemetryRecorder,
+    config,
+    clientConfig,
+    staticDefaultContext,
+}: GetAppWrappersOptions): Wrapper[] {
+    return [
+        {
+            provider: TelemetryRecorderContext.Provider,
+            value: telemetryRecorder,
+        } satisfies Wrapper<ComponentProps<typeof TelemetryRecorderContext.Provider>['value']>,
+        {
+            component: ExtensionAPIProviderFromVSCodeAPI,
+            props: { vscodeAPI, staticDefaultContext },
+        } satisfies Wrapper<any, ComponentProps<typeof ExtensionAPIProviderFromVSCodeAPI>>,
+        {
+            component: ConfigProvider,
+            props: { value: config },
+        } satisfies Wrapper<any, ComponentProps<typeof ConfigProvider>>,
+        {
+            component: ClientConfigProvider,
+            props: { value: clientConfig },
+        } satisfies Wrapper<any, ComponentProps<typeof ClientConfigProvider>>,
+    ]
 }

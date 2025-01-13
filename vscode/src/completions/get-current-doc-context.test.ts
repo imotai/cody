@@ -5,26 +5,27 @@ import type * as Parser from 'web-tree-sitter'
 
 import { range } from '../testutils/textDocument'
 import { asPoint } from '../tree-sitter/parse-tree-cache'
-import { resetParsersCache } from '../tree-sitter/parser'
+import { type WrappedParser, resetParsersCache } from '../tree-sitter/parser'
 
+import type { DocumentContext } from '@sourcegraph/cody-shared'
 import { getContextRange } from './doc-context-getters'
-import {
-    getCurrentDocContext,
-    insertIntoDocContext,
-    type DocumentContext,
-} from './get-current-doc-context'
+import { getCurrentDocContext, insertIntoDocContext } from './get-current-doc-context'
 import { documentAndPosition, initTreeSitterParser } from './test-helpers'
 
-function testGetCurrentDocContext(code: string, context?: vscode.InlineCompletionContext) {
+function testGetCurrentDocContext(
+    code: string,
+    context?: vscode.InlineCompletionContext,
+    maxPrefixLength = 100,
+    maxSuffixLength = 100
+) {
     const { document, position } = documentAndPosition(code)
 
     return getCurrentDocContext({
         document,
         position,
-        maxPrefixLength: 100,
-        maxSuffixLength: 100,
+        maxPrefixLength,
+        maxSuffixLength,
         context,
-        dynamicMultilineCompletions: false,
     })
 }
 
@@ -33,6 +34,8 @@ describe('getCurrentDocContext', () => {
         const result = testGetCurrentDocContext('function myFunction() {\n  █')
 
         expect(result).toEqual({
+            completePrefix: 'function myFunction() {\n  ',
+            completeSuffix: '',
             prefix: 'function myFunction() {\n  ',
             suffix: '',
             currentLinePrefix: '  ',
@@ -45,7 +48,40 @@ describe('getCurrentDocContext', () => {
                 line: 0,
             },
             injectedPrefix: null,
+            maxPrefixLength: 100,
+            maxSuffixLength: 100,
             position: { character: 2, line: 1 },
+        })
+    })
+
+    it('returns `completePrefix` and `completeSuffix` correctly for large files', () => {
+        const longPrefix = '// Some big prefix in the code\n'.repeat(100)
+        const longSuffix = '// Some big suffix in the code\n'.repeat(100)
+        const immediatePrefix = 'const value = 5;\nif('
+        const immediateSuffix = '){\n    console.log(value)\n}\n'
+        const code = `${longPrefix}${immediatePrefix}█${immediateSuffix}${longSuffix}`
+        const result = testGetCurrentDocContext(
+            code,
+            undefined,
+            immediatePrefix.length,
+            immediateSuffix.length
+        )
+
+        expect(result).toEqual({
+            completePrefix: `${longPrefix}${immediatePrefix}`,
+            completeSuffix: `${immediateSuffix}${longSuffix}`,
+            prefix: immediatePrefix,
+            suffix: immediateSuffix.trimEnd().replace(/\n$/, ''),
+            currentLinePrefix: 'if(',
+            currentLineSuffix: '){',
+            prevNonEmptyLine: 'const value = 5;',
+            nextNonEmptyLine: '    console.log(value)',
+            multilineTrigger: null,
+            multilineTriggerPosition: null,
+            injectedPrefix: null,
+            maxPrefixLength: immediatePrefix.length,
+            maxSuffixLength: immediateSuffix.length,
+            position: { character: 3, line: longPrefix.split('\n').length },
         })
     })
 
@@ -53,6 +89,8 @@ describe('getCurrentDocContext', () => {
         const result = testGetCurrentDocContext('const x = 1\nif (true) {\n  █\n}')
 
         expect(result).toEqual({
+            completePrefix: 'const x = 1\nif (true) {\n  ',
+            completeSuffix: '\n}',
             prefix: 'const x = 1\nif (true) {\n  ',
             suffix: '\n}',
             currentLinePrefix: '  ',
@@ -65,6 +103,8 @@ describe('getCurrentDocContext', () => {
                 line: 1,
             },
             injectedPrefix: null,
+            maxPrefixLength: 100,
+            maxSuffixLength: 100,
             position: { character: 2, line: 2 },
         })
     })
@@ -73,6 +113,8 @@ describe('getCurrentDocContext', () => {
         const result = testGetCurrentDocContext('const arr = [█\n];')
 
         expect(result).toEqual({
+            completePrefix: 'const arr = [',
+            completeSuffix: '\n];',
             prefix: 'const arr = [',
             suffix: '\n];',
             currentLinePrefix: 'const arr = [',
@@ -85,6 +127,8 @@ describe('getCurrentDocContext', () => {
                 line: 0,
             },
             injectedPrefix: null,
+            maxPrefixLength: 100,
+            maxSuffixLength: 100,
             position: { character: 13, line: 0 },
         })
     })
@@ -93,6 +137,8 @@ describe('getCurrentDocContext', () => {
         const result = testGetCurrentDocContext('console.log(1337);\r\nconst arr = [█\r\n];')
 
         expect(result).toEqual({
+            completePrefix: 'console.log(1337);\nconst arr = [',
+            completeSuffix: '\n];',
             prefix: 'console.log(1337);\nconst arr = [',
             suffix: '\n];',
             currentLinePrefix: 'const arr = [',
@@ -105,6 +151,8 @@ describe('getCurrentDocContext', () => {
                 line: 1,
             },
             injectedPrefix: null,
+            maxPrefixLength: 100,
+            maxSuffixLength: 100,
             position: { character: 13, line: 1 },
         })
     })
@@ -124,6 +172,8 @@ describe('getCurrentDocContext', () => {
         )
 
         expect(result).toEqual({
+            completePrefix: 'console.assert',
+            completeSuffix: '',
             prefix: 'console.assert',
             suffix: '',
             currentLinePrefix: 'console.assert',
@@ -133,6 +183,8 @@ describe('getCurrentDocContext', () => {
             multilineTrigger: null,
             multilineTriggerPosition: null,
             injectedPrefix: 'ssert',
+            maxPrefixLength: 100,
+            maxSuffixLength: 100,
             position: { character: 9, line: 0 },
         })
     })
@@ -153,6 +205,8 @@ describe('getCurrentDocContext', () => {
         )
 
         expect(result).toEqual({
+            completePrefix: '// some line before\nconsole.log',
+            completeSuffix: '',
             prefix: '// some line before\nconsole.log',
             suffix: '',
             currentLinePrefix: 'console.log',
@@ -162,6 +216,8 @@ describe('getCurrentDocContext', () => {
             multilineTrigger: null,
             multilineTriggerPosition: null,
             injectedPrefix: 'log',
+            maxPrefixLength: 100,
+            maxSuffixLength: 100,
             position: { character: 8, line: 1 },
         })
     })
@@ -181,26 +237,29 @@ describe('getCurrentDocContext', () => {
         )
 
         expect(result).toEqual({
-            prefix: 'console',
-            suffix: '',
+            completePrefix: 'console',
+            completeSuffix: '',
             currentLinePrefix: 'console',
             currentLineSuffix: '',
+            prefix: 'console',
+            suffix: '',
             prevNonEmptyLine: '',
             nextNonEmptyLine: '',
             multilineTrigger: null,
             multilineTriggerPosition: null,
             injectedPrefix: null,
+            maxPrefixLength: 100,
+            maxSuffixLength: 100,
             position: { character: 7, line: 0 },
         })
     })
 
     describe('multiline triggers', () => {
-        let parser: Parser
+        let parser: WrappedParser
 
         interface PrepareTestParams {
             code: string
-            dynamicMultilineCompletions: boolean
-            langaugeId?: string
+            languageId?: string
         }
 
         interface PrepareTestResult {
@@ -209,8 +268,8 @@ describe('getCurrentDocContext', () => {
         }
 
         function prepareTest(params: PrepareTestParams): PrepareTestResult {
-            const { dynamicMultilineCompletions, code, langaugeId } = params
-            const { document, position } = documentAndPosition(code, langaugeId)
+            const { code, languageId } = params
+            const { document, position } = documentAndPosition(code, languageId)
 
             const tree = parser.parse(document.getText())
             const docContext = getCurrentDocContext({
@@ -218,7 +277,6 @@ describe('getCurrentDocContext', () => {
                 position,
                 maxPrefixLength: 100,
                 maxSuffixLength: 100,
-                dynamicMultilineCompletions,
             })
 
             return { tree, docContext }
@@ -236,114 +294,85 @@ describe('getCurrentDocContext', () => {
             resetParsersCache()
         })
 
-        describe('with enabled dynamicMultilineCompletions', () => {
-            it.each([
-                dedent`
+        it.each([
+            dedent`
                     def greatest_common_divisor(a, b):█
                 `,
-                dedent`
+            dedent`
                     def greatest_common_divisor(a, b):
                         if a == 0:█
                 `,
-                dedent`
+            dedent`
                     def bubbleSort(arr):
                         n = len(arr)
                         for i in range(n-1):
                             █
                 `,
-            ])('detects the multiline trigger for python', code => {
-                const {
-                    tree,
-                    docContext: { multilineTrigger, multilineTriggerPosition },
-                } = prepareTest({ code, dynamicMultilineCompletions: true, langaugeId: 'python' })
+        ])('detects the multiline trigger for python', code => {
+            const {
+                tree,
+                docContext: { multilineTrigger, multilineTriggerPosition },
+            } = prepareTest({ code, languageId: 'python' })
 
-                const triggerNode = tree.rootNode.descendantForPosition(
-                    asPoint(multilineTriggerPosition!)
-                )
-                expect(multilineTrigger).toBe(triggerNode.text)
-            })
+            const triggerNode = tree.rootNode.descendantForPosition(asPoint(multilineTriggerPosition!))
+            expect(multilineTrigger).toBe(triggerNode.text)
+        })
 
-            it.each([
-                'const results = {█',
-                'const result = {\n  █',
-                'const result = {\n    █',
-                'const something = true\nfunction bubbleSort(█)',
-            ])('returns correct multiline trigger position', code => {
-                const {
-                    tree,
-                    docContext: { multilineTrigger, multilineTriggerPosition },
-                } = prepareTest({ code, dynamicMultilineCompletions: true })
+        it.each([
+            'const results = {█',
+            'const result = {\n  █',
+            'const result = {\n    █',
+            'const something = true\nfunction bubbleSort(█)',
+        ])('returns correct multiline trigger position', code => {
+            const {
+                tree,
+                docContext: { multilineTrigger, multilineTriggerPosition },
+            } = prepareTest({ code })
 
-                const triggerNode = tree.rootNode.descendantForPosition(
-                    asPoint(multilineTriggerPosition!)
-                )
-                expect(multilineTrigger).toBe(triggerNode.text)
-            })
+            const triggerNode = tree.rootNode.descendantForPosition(asPoint(multilineTriggerPosition!))
+            expect(multilineTrigger).toBe(triggerNode.text)
+        })
 
-            it.each([
-                dedent`
+        it.each([
+            dedent`
                     detectMultilineTrigger(
                         █
                     )
                 `,
-                dedent`
+            dedent`
                     const oddNumbers = [
                         █
                     ]
                 `,
-                dedent`
+            dedent`
                     type Whatever = {
                         █
                     }
                 `,
-            ])('detects the multiline trigger on the new line inside of parentheses', code => {
+        ])('detects the multiline trigger on the new line inside of parentheses', code => {
+            const {
+                tree,
+                docContext: { multilineTrigger, multilineTriggerPosition },
+            } = prepareTest({ code })
+
+            const triggerNode = tree.rootNode.descendantForPosition(asPoint(multilineTriggerPosition!))
+            expect(triggerNode.text).toBe(multilineTrigger)
+        })
+
+        it.each(['const oddNumbers = [█]', 'const result = {█}'])(
+            'detects the multiline trigger on the current line inside of parentheses',
+            code => {
                 const {
                     tree,
                     docContext: { multilineTrigger, multilineTriggerPosition },
-                } = prepareTest({ code, dynamicMultilineCompletions: true })
+                } = prepareTest({ code })
 
                 const triggerNode = tree.rootNode.descendantForPosition(
                     asPoint(multilineTriggerPosition!)
                 )
                 expect(triggerNode.text).toBe(multilineTrigger)
-            })
-        })
-
-        describe('with disabled dynamicMultilineCompletions', () => {
-            it.each([
-                dedent`
-                    detectMultilineTrigger(
-                        █
-                    )
-                `,
-                dedent`
-                    const oddNumbers = [
-                        █
-                    ]
-                `,
-            ])('does not detect the multiline trigger on the new line inside of parentheses', code => {
-                const { multilineTrigger } = prepareTest({
-                    code,
-                    dynamicMultilineCompletions: false,
-                }).docContext
-                expect(multilineTrigger).toBeNull()
-            })
-
-            it.each(['detectMultilineTrigger(█)', 'const oddNumbers = [█]', 'const result = {█}'])(
-                'detects the multiline trigger on the current line inside of parentheses',
-                code => {
-                    const {
-                        tree,
-                        docContext: { multilineTrigger, multilineTriggerPosition },
-                    } = prepareTest({ code, dynamicMultilineCompletions: true })
-
-                    const triggerNode = tree.rootNode.descendantForPosition(
-                        asPoint(multilineTriggerPosition!)
-                    )
-                    expect(triggerNode.text).toBe(multilineTrigger)
-                }
-            )
-        })
+            }
+        )
     })
 })
 
@@ -372,7 +401,6 @@ describe('getContextRange', () => {
             position,
             maxPrefixLength: 140,
             maxSuffixLength: 60,
-            dynamicMultilineCompletions: false,
         })
         const contextRange = getContextRange(document, docContext)
 
@@ -405,7 +433,6 @@ describe('insertCompletionIntoDocContext', () => {
             position,
             maxPrefixLength: 140,
             maxSuffixLength: 60,
-            dynamicMultilineCompletions: false,
         })
 
         const insertText = "console.log('hello')\n    console.log('world')"
@@ -414,10 +441,14 @@ describe('insertCompletionIntoDocContext', () => {
             docContext,
             insertText,
             languageId: document.languageId,
-            dynamicMultilineCompletions: false,
         })
 
         expect(updatedDocContext).toEqual({
+            completePrefix: dedent`
+                function helloWorld() {
+                    console.log('hello')
+                    console.log('world')`,
+            completeSuffix: '\n}',
             prefix: dedent`
                 function helloWorld() {
                     console.log('hello')
@@ -431,6 +462,8 @@ describe('insertCompletionIntoDocContext', () => {
             multilineTrigger: null,
             multilineTriggerPosition: null,
             injectedPrefix: null,
+            maxPrefixLength: 140,
+            maxSuffixLength: 60,
             position: { character: 24, line: 2 },
             positionWithoutInjectedCompletionText: docContext.position,
         })
@@ -449,7 +482,6 @@ describe('insertCompletionIntoDocContext', () => {
             position,
             maxPrefixLength: 140,
             maxSuffixLength: 60,
-            dynamicMultilineCompletions: false,
         })
 
         const insertText = "'hello', 'world')"
@@ -457,10 +489,13 @@ describe('insertCompletionIntoDocContext', () => {
             docContext,
             insertText,
             languageId: document.languageId,
-            dynamicMultilineCompletions: false,
         })
 
         expect(updatedDocContext).toEqual({
+            completePrefix: dedent`
+                function helloWorld() {
+                    console.log('hello', 'world')`,
+            completeSuffix: '\n}',
             prefix: dedent`
                 function helloWorld() {
                     console.log('hello', 'world')`,
@@ -473,6 +508,8 @@ describe('insertCompletionIntoDocContext', () => {
             multilineTrigger: null,
             multilineTriggerPosition: null,
             injectedPrefix: null,
+            maxPrefixLength: 140,
+            maxSuffixLength: 60,
             // Note: The position is always moved at the end of the line that the text was inserted
             position: { character: "    console.log('hello', 'world')".length, line: 1 },
             positionWithoutInjectedCompletionText: docContext.position,
@@ -492,7 +529,6 @@ describe('insertCompletionIntoDocContext', () => {
             position,
             maxPrefixLength: 140,
             maxSuffixLength: 60,
-            dynamicMultilineCompletions: false,
         })
 
         const insertText = '\n        propA: foo,\n        propB: bar,\n    }, 2)'
@@ -500,10 +536,17 @@ describe('insertCompletionIntoDocContext', () => {
             docContext,
             insertText,
             languageId: document.languageId,
-            dynamicMultilineCompletions: false,
         })
 
         expect(updatedDocContext).toEqual({
+            completePrefix: dedent`
+                function helloWorld() {
+                    f(1, {
+                        propA: foo,
+                        propB: bar,
+                    }, 2)
+            `,
+            completeSuffix: '\n}',
             prefix: dedent`
                 function helloWorld() {
                     f(1, {
@@ -520,8 +563,181 @@ describe('insertCompletionIntoDocContext', () => {
             multilineTrigger: null,
             multilineTriggerPosition: null,
             injectedPrefix: null,
+            maxPrefixLength: 140,
+            maxSuffixLength: 60,
             // Note: The position is always moved at the end of the line that the text was inserted
             position: { character: '    }, 2)'.length, line: 4 },
+            positionWithoutInjectedCompletionText: docContext.position,
+        })
+    })
+
+    it('inserts the completion for the big document', () => {
+        const repeatCount = 5
+        const longPrefix = '// Some big prefix in the code\n'.repeat(repeatCount)
+        const longSuffix = '\n// Some big suffix in the code'.repeat(repeatCount)
+        const middleCode = dedent`
+            function helloWorld() {
+                █
+            }
+        `
+        const code = `${longPrefix}${middleCode}${longSuffix}`
+        const insertText = "console.log('hello')\n    console.log('world')"
+
+        const { document, position } = documentAndPosition(code)
+        const maxPrefixLength = insertText.length + middleCode.indexOf('█')
+        const maxSuffixLength = middleCode.length - middleCode.indexOf('█')
+
+        const docContext = getCurrentDocContext({
+            document,
+            position,
+            maxPrefixLength,
+            maxSuffixLength,
+        })
+
+        const updatedDocContext = insertIntoDocContext({
+            docContext,
+            insertText,
+            languageId: document.languageId,
+        })
+
+        expect(updatedDocContext).toEqual({
+            completePrefix: dedent`
+                ${longPrefix}function helloWorld() {
+                    console.log('hello')
+                    console.log('world')`,
+            completeSuffix: `\n}${longSuffix}`,
+            prefix: dedent`
+                function helloWorld() {
+                    console.log('hello')
+                    console.log('world')`,
+            suffix: '\n}',
+            currentLinePrefix: "    console.log('world')",
+            currentLineSuffix: '',
+            injectedCompletionText: insertText,
+            prevNonEmptyLine: "    console.log('hello')",
+            nextNonEmptyLine: '}',
+            multilineTrigger: null,
+            multilineTriggerPosition: null,
+            injectedPrefix: null,
+            maxPrefixLength: maxPrefixLength,
+            maxSuffixLength: maxSuffixLength,
+            position: { character: 24, line: repeatCount + 2 },
+            positionWithoutInjectedCompletionText: docContext.position,
+        })
+    })
+
+    it('does not duplicate the insertion characters for single-line completion with long prefix and suffix', () => {
+        const repeatCount = 5
+        const longPrefix = '// Some big prefix in the code\n'.repeat(repeatCount)
+        const longSuffix = '\n// Some big suffix in the code'.repeat(repeatCount)
+        const middleCode = dedent`
+            function helloWorld() {
+                console.log(█, 'world')
+            }
+        `
+        const code = `${longPrefix}${middleCode}${longSuffix}`
+        const insertText = "'hello', 'world')"
+
+        const maxPrefixLength = insertText.length + middleCode.indexOf('█')
+        const maxSuffixLength = middleCode.length - middleCode.indexOf('█')
+
+        const { document, position } = documentAndPosition(code)
+        const docContext = getCurrentDocContext({
+            document,
+            position,
+            maxPrefixLength,
+            maxSuffixLength,
+        })
+
+        const updatedDocContext = insertIntoDocContext({
+            docContext,
+            insertText,
+            languageId: document.languageId,
+        })
+
+        expect(updatedDocContext).toEqual({
+            completePrefix: dedent`
+                ${longPrefix}function helloWorld() {
+                    console.log('hello', 'world')`,
+            completeSuffix: `\n}${longSuffix}`,
+            prefix: dedent`
+                function helloWorld() {
+                    console.log('hello', 'world')`,
+            suffix: '\n}',
+            currentLinePrefix: "    console.log('hello', 'world')",
+            currentLineSuffix: '',
+            injectedCompletionText: insertText,
+            prevNonEmptyLine: 'function helloWorld() {',
+            nextNonEmptyLine: '}',
+            multilineTrigger: null,
+            multilineTriggerPosition: null,
+            injectedPrefix: null,
+            maxPrefixLength: maxPrefixLength,
+            maxSuffixLength: maxSuffixLength,
+            // Note: The position is always moved at the end of the line that the text was inserted
+            position: { character: "    console.log('hello', 'world')".length, line: repeatCount + 1 },
+            positionWithoutInjectedCompletionText: docContext.position,
+        })
+    })
+
+    it('does not duplicate the insertion characters for multi-line completion with long prefix and suffix', () => {
+        const repeatCount = 5
+        const longPrefix = '// Some big prefix in the code\n'.repeat(repeatCount)
+        const longSuffix = '\n// Some big suffix in the code'.repeat(repeatCount)
+        const middleCode = dedent`
+            function helloWorld() {
+                f(1, {█2)
+            }
+        `
+        const code = `${longPrefix}${middleCode}${longSuffix}`
+        const insertText = '\n        propA: foo,\n        propB: bar,\n    }, 2)'
+
+        const maxPrefixLength = insertText.length + middleCode.indexOf('█')
+        const maxSuffixLength = middleCode.length - middleCode.indexOf('█')
+
+        const { document, position } = documentAndPosition(code)
+        const docContext = getCurrentDocContext({
+            document,
+            position,
+            maxPrefixLength,
+            maxSuffixLength,
+        })
+
+        const updatedDocContext = insertIntoDocContext({
+            docContext,
+            insertText,
+            languageId: document.languageId,
+        })
+
+        expect(updatedDocContext).toEqual({
+            completePrefix: dedent`
+                ${longPrefix}function helloWorld() {
+                    f(1, {
+                        propA: foo,
+                        propB: bar,
+                    }, 2)
+            `,
+            completeSuffix: `\n}${longSuffix}`,
+            prefix: dedent`
+                function helloWorld() {
+                    f(1, {
+                        propA: foo,
+                        propB: bar,
+                    }, 2)
+            `,
+            suffix: '\n}',
+            currentLinePrefix: '    }, 2)',
+            currentLineSuffix: '',
+            injectedCompletionText: insertText,
+            prevNonEmptyLine: '        propB: bar,',
+            nextNonEmptyLine: '}',
+            multilineTrigger: null,
+            multilineTriggerPosition: null,
+            injectedPrefix: null,
+            maxPrefixLength: maxPrefixLength,
+            maxSuffixLength: maxSuffixLength,
+            // Note: The position is always moved at the end of the line that the text was inserted
+            position: { character: '    }, 2)'.length, line: repeatCount + 4 },
             positionWithoutInjectedCompletionText: docContext.position,
         })
     })

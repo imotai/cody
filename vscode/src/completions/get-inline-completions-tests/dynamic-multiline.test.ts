@@ -25,7 +25,6 @@ describe('[getInlineCompletions] dynamic multiline', () => {
             console.log(5)█`,
             {
                 delayBetweenChunks: 50,
-                configuration: { autocompleteExperimentalDynamicMultilineCompletions: true },
             }
         )
 
@@ -47,10 +46,7 @@ describe('[getInlineCompletions] dynamic multiline', () => {
                 }
 
                 return value█
-            }`,
-            {
-                configuration: { autocompleteExperimentalDynamicMultilineCompletions: true },
-            }
+            }`
         )
 
         expect(items[0].insertText).toMatchInlineSnapshot(`
@@ -69,10 +65,7 @@ describe('[getInlineCompletions] dynamic multiline', () => {
             )
 
             const compeltion = new InlineCompletion(result)█
-            console.log(completion)`,
-            {
-                configuration: { autocompleteExperimentalDynamicMultilineCompletions: true },
-            }
+            console.log(completion)`
         )
 
         expect(items[0].insertText).toMatchInlineSnapshot(`
@@ -94,10 +87,7 @@ describe('[getInlineCompletions] dynamic multiline', () => {
                 9,
             ]█
 
-            console.log(oddNumbers)`,
-            {
-                configuration: { autocompleteExperimentalDynamicMultilineCompletions: true },
-            }
+            console.log(oddNumbers)`
         )
 
         expect(items[0].insertText).toMatchInlineSnapshot(`
@@ -111,22 +101,21 @@ describe('[getInlineCompletions] dynamic multiline', () => {
         `)
     })
 
-    it('does not use dynamic multiline for certain black listed cases', async () => {
+    it('does not use dynamic multiline completions for certain languages', async () => {
         const { items } = await getInlineCompletionsWithInlinedChunks(
-            `class █Test {
-                constructor() {
-                    console.log(1)
-                █   console.log(2)
-                    console.log(3)
-                    console.█log(4)
-                }
-            }
-            console.log(5)█`,
+            `
+- Autocomplete: Improved the new jaccard similarity retriever
+- Edit: Added a multi-model selector. [pull/2951](█https://github.com/sourcegraph/cody/pull/2951)
+- Edit: █Added Cody Pro support for models: █GPT-4. [█pull/2951](https://github.com/sourcegraph/cody/pull/2951)█
+- Autocomplete: Remove obvious prompt-continuations. [pull/2974](https://github.com/sourcegraph/cody/pull/2974)`,
             {
-                configuration: { autocompleteExperimentalDynamicMultilineCompletions: true },
+                delayBetweenChunks: 50,
+                languageId: 'markdown',
             }
         )
 
-        expect(items[0]?.insertText).toMatchInlineSnapshot('"Test {"')
+        expect(items[0].insertText).toMatchInlineSnapshot(
+            `"https://github.com/sourcegraph/cody/pull/2951)"`
+        )
     })
 })

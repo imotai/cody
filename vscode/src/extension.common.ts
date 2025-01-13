@@ -1,24 +1,19 @@
 import * as vscode from 'vscode'
 
-import type {
-    Configuration,
-    ConfigurationWithAccessToken,
-    SourcegraphBrowserCompletionsClient,
-} from '@sourcegraph/cody-shared'
-import type { SourcegraphNodeCompletionsClient } from '@sourcegraph/cody-shared/src/sourcegraph-api/completions/nodeClient'
-
-import type { BfgRetriever } from './completions/context/retrievers/bfg/bfg-retriever'
+import type { CompletionLogger, SourcegraphCompletionsClient } from '@sourcegraph/cody-shared'
+import type { startTokenReceiver } from './auth/token-receiver'
 import { onActivationDevelopmentHelpers } from './dev/helpers'
-
 import './editor/displayPathEnvInfo' // import for side effects
-
+import type { createController } from '@openctx/vscode-lib'
+import type { Noxide } from '@sourcegraph/cody-noxide'
+import type { CommandsProvider } from './commands/services/provider'
 import { ExtensionApi } from './extension-api'
-import type { LocalEmbeddingsConfig, LocalEmbeddingsController } from './local-context/local-embeddings'
+import type { ExtensionClient } from './extension-client'
 import type { SymfRunner } from './local-context/symf'
 import { start } from './main'
+import type { DelegatingAgent } from './net'
 import type { OpenTelemetryService } from './services/open-telemetry/OpenTelemetryService.node'
-import { captureException, type SentryService } from './services/sentry/sentry'
-import type { CommandsProvider } from './commands/services/provider'
+import { type SentryService, captureException } from './services/sentry/sentry'
 
 type Constructor<T extends new (...args: any) => any> = T extends new (
     ...args: infer A
@@ -27,27 +22,44 @@ type Constructor<T extends new (...args: any) => any> = T extends new (
     : never
 
 export interface PlatformContext {
+    networkAgent?: DelegatingAgent
+    noxide?: Noxide
+    createOpenCtxController?: typeof createController
+    createStorage?: () => Promise<vscode.Memento>
     createCommandsProvider?: Constructor<typeof CommandsProvider>
-    createLocalEmbeddingsController?: (config: LocalEmbeddingsConfig) => LocalEmbeddingsController
     createSymfRunner?: Constructor<typeof SymfRunner>
-    createBfgRetriever?: () => BfgRetriever
-    createCompletionsClient:
-        | Constructor<typeof SourcegraphBrowserCompletionsClient>
-        | Constructor<typeof SourcegraphNodeCompletionsClient>
-    createSentryService?: (config: Pick<ConfigurationWithAccessToken, 'serverEndpoint'>) => SentryService
-    createOpenTelemetryService?: (
-        config: Pick<ConfigurationWithAccessToken, 'serverEndpoint' | 'experimentalTracing'>
-    ) => OpenTelemetryService
-    onConfigurationChange?: (configuration: Configuration) => void
+    createCompletionsClient: (logger?: CompletionLogger) => SourcegraphCompletionsClient
+    createSentryService?: () => SentryService
+    createOpenTelemetryService?: () => OpenTelemetryService
+    startTokenReceiver?: typeof startTokenReceiver
+    otherInitialization?: () => vscode.Disposable
+    extensionClient: ExtensionClient
+}
+
+interface ActivationContext {
+    initializeNoxideLib?: () => Noxide | undefined
+    initializeNetworkAgent?: (ctx: { noxide?: Noxide | undefined }) => Promise<DelegatingAgent>
 }
 
 export async function activate(
     context: vscode.ExtensionContext,
-    platformContext: PlatformContext
+    {
+        initializeNetworkAgent,
+        initializeNoxideLib,
+        ...platformContext
+    }: PlatformContext & ActivationContext
 ): Promise<ExtensionApi> {
-    const api = new ExtensionApi()
-
+    //TODO: Properly handle extension mode overrides in a single way
+    platformContext.noxide = initializeNoxideLib?.() || undefined
+    const api = new ExtensionApi(context.extensionMode)
     try {
+        // Important! This needs to happen before we resolve the config
+        // Otherwise some eager beavers might start making network requests
+        const networkAgent = await initializeNetworkAgent?.(platformContext)
+        if (networkAgent) {
+            context.subscriptions.push(networkAgent)
+            platformContext.networkAgent = networkAgent
+        }
         const disposable = await start(context, platformContext)
         if (!context.globalState.get('extension.hasActivatedPreviously')) {
             void context.globalState.update('extension.hasActivatedPreviously', 'true')
@@ -61,6 +73,5 @@ export async function activate(
         captureException(error)
         console.error(error)
     }
-
     return api
 }

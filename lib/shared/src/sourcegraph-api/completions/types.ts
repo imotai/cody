@@ -1,3 +1,6 @@
+import type { SerializedChatMessage } from '../../chat/transcript/messages'
+import type { PromptString } from '../../prompt/prompt-string'
+
 interface DoneEvent {
     type: 'done'
 }
@@ -14,13 +17,14 @@ interface ErrorEvent {
 export type Event = DoneEvent | CompletionEvent | ErrorEvent
 
 export interface Message {
-    speaker: 'human' | 'assistant'
-    text?: string
+    // Note: The unified API only supports one system message passed as the first message
+    speaker: 'human' | 'assistant' | 'system'
+    text?: PromptString
 }
 
 export interface CompletionResponse {
     completion: string
-    stopReason: string
+    stopReason?: string
 }
 
 export interface CompletionParameters {
@@ -32,6 +36,19 @@ export interface CompletionParameters {
     topK?: number
     topP?: number
     model?: string
+    stream?: boolean
+    // Configuration for a Predicted Output, which can greatly improve response
+    // times when large parts of the model response are known ahead of time.
+    // https://platform.openai.com/docs/guides/latency-optimization#use-predicted-outputs
+    // https://platform.openai.com/docs/api-reference/chat/create#chat-create-prediction
+    prediction?: {
+        type: 'content'
+        content: string
+    }
+}
+
+export interface SerializedCompletionParameters extends Omit<CompletionParameters, 'messages'> {
+    messages: SerializedChatMessage[]
 }
 
 export interface CompletionCallbacks {

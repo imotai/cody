@@ -1,29 +1,47 @@
 import * as vscode from 'vscode'
 
+import { type BillingCategory, CodyIDE, telemetryRecorder } from '@sourcegraph/cody-shared'
 import {
     ACCOUNT_LIMITS_INFO_URL,
     ACCOUNT_UPGRADE_URL,
     ACCOUNT_USAGE_URL,
     CODY_DOC_URL,
     CODY_FEEDBACK_URL,
+    CODY_SUPPORT_URL,
     DISCORD_URL,
 } from '../chat/protocol'
-import { telemetryService } from '../services/telemetry'
-import { telemetryRecorder } from '../services/telemetry-v2'
-import { releaseNotesURL } from '../release'
+import { getReleaseNotesURLByIDE } from '../release'
 import { version } from '../version'
 
-export function registerSidebarCommands(): vscode.Disposable[] {
-    function logSidebarClick(feature: string) {
-        telemetryService.log(`CodyVSCodeExtension:sidebar:${feature}:clicked`, undefined, {
-            hasV2Event: true,
-        })
-        telemetryRecorder.recordEvent(`cody.sidebar.${feature}`, 'clicked')
-    }
+export function logSidebarClick(feature: string, billingCategory?: BillingCategory) {
+    telemetryRecorder.recordEvent(
+        `cody.sidebar.${feature}`,
+        'clicked',
+        billingCategory
+            ? {
+                  billingMetadata: {
+                      category: billingCategory,
+                      product: 'cody',
+                  },
+              }
+            : {}
+    )
+}
 
+export function registerSidebarCommands(): vscode.Disposable[] {
     return [
+        vscode.commands.registerCommand('cody.sidebar.commands', (feature: string, command: string) => {
+            // For Custom Commands
+            if (command === 'cody.action.command') {
+                logSidebarClick('custom', 'core')
+                void vscode.commands.executeCommand(command, feature, { source: 'sidebar' })
+                return
+            }
+            logSidebarClick(feature, 'core')
+            void vscode.commands.executeCommand(command, { source: 'sidebar' })
+        }),
         vscode.commands.registerCommand('cody.show-page', (page: string) => {
-            logSidebarClick(page)
+            logSidebarClick(page, 'billable')
             let url: URL
             switch (page) {
                 case 'upgrade':
@@ -42,11 +60,11 @@ export function registerSidebarCommands(): vscode.Disposable[] {
             void vscode.env.openExternal(vscode.Uri.parse(url.toString()))
         }),
         vscode.commands.registerCommand('cody.sidebar.settings', () => {
-            logSidebarClick('settings')
+            logSidebarClick('settings', 'billable')
             void vscode.commands.executeCommand('cody.status-bar.interacted')
         }),
         vscode.commands.registerCommand('cody.sidebar.keyboardShortcuts', () => {
-            logSidebarClick('keyboardShortcuts')
+            logSidebarClick('keyboardShortcuts', 'billable')
             void vscode.commands.executeCommand(
                 'workbench.action.openGlobalKeybindings',
                 '@ext:sourcegraph.cody-ai'
@@ -54,11 +72,18 @@ export function registerSidebarCommands(): vscode.Disposable[] {
         }),
         vscode.commands.registerCommand('cody.sidebar.releaseNotes', () => {
             logSidebarClick('releaseNotes')
-            void vscode.commands.executeCommand('vscode.open', releaseNotesURL(version))
+            void vscode.commands.executeCommand(
+                'vscode.open',
+                getReleaseNotesURLByIDE(version, CodyIDE.VSCode)
+            )
         }),
         vscode.commands.registerCommand('cody.sidebar.documentation', () => {
-            logSidebarClick('documentation')
+            logSidebarClick('documentation', 'billable')
             void vscode.commands.executeCommand('vscode.open', CODY_DOC_URL.href)
+        }),
+        vscode.commands.registerCommand('cody.sidebar.support', () => {
+            logSidebarClick('support')
+            void vscode.commands.executeCommand('vscode.open', CODY_SUPPORT_URL.href)
         }),
         vscode.commands.registerCommand('cody.sidebar.feedback', () => {
             logSidebarClick('feedback')
@@ -69,8 +94,12 @@ export function registerSidebarCommands(): vscode.Disposable[] {
             void vscode.commands.executeCommand('vscode.open', DISCORD_URL.href)
         }),
         vscode.commands.registerCommand('cody.sidebar.account', () => {
-            logSidebarClick('account')
+            logSidebarClick('account', 'billable')
             void vscode.commands.executeCommand('cody.auth.account')
+        }),
+        vscode.commands.registerCommand('cody.sidebar.logs', () => {
+            logSidebarClick('logs')
+            void vscode.commands.executeCommand('cody.debug.export.logs')
         }),
     ]
 }

@@ -2,7 +2,7 @@ name: Semgrep - SAST Scan
 
 on:
   pull_request_target:
-    types: [ closed, edited, opened, synchronize, ready_for_review ]
+    types: [edited, opened, synchronize, ready_for_review]
 
 jobs:
   semgrep:
@@ -15,10 +15,13 @@ jobs:
       image: returntocorp/semgrep
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
 
       - name: Checkout semgrep-rules repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: sourcegraph/security-semgrep-rules
           token: ${{ secrets.GH_SEMGREP_SAST_TOKEN }}
@@ -26,8 +29,9 @@ jobs:
 
       - name: Run Semgrep SAST Scan
         run: |
-          semgrep ci -f semgrep-rules/ --metrics=off --oss-only --suppress-errors --sarif -o results.sarif --exclude='semgrep-rules'
+          mv semgrep-rules ../
+          semgrep ci -f ../semgrep-rules/semgrep-rules/ --metrics=off --oss-only --suppress-errors --sarif -o results.sarif --exclude='semgrep-rules' --baseline-commit "$(git merge-base main HEAD)" || true
       - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif

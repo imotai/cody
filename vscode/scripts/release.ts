@@ -1,6 +1,6 @@
-import { execFileSync } from 'child_process'
-import fs from 'fs'
-import path from 'path'
+import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
 
 import semver from 'semver'
 
@@ -121,6 +121,18 @@ const insidersVersion = semver
 if (!insidersVersion) {
     console.error('Could not increment version for insiders release.')
     process.exit(1)
+}
+
+const githubOutputPath = process.env.GITHUB_OUTPUT
+if (releaseType === ReleaseType.Insiders && githubOutputPath) {
+    // Output a tag for the release. We only generate tags for insiders
+    // releases. For stable releases the tag already exists: The release job
+    // is triggered when the tag is created.
+    fs.writeFileSync(githubOutputPath, `version_tag=vscode-insiders-v${insidersVersion}\n`, {
+        encoding: 'utf8',
+        flush: true,
+        flag: 'a',
+    })
 }
 
 const version = releaseType === ReleaseType.Insiders ? insidersVersion : packageJSONVersion

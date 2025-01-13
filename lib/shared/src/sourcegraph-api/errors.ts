@@ -24,7 +24,7 @@ export class RateLimitError extends Error {
     public readonly retryMessage: string | undefined
 
     constructor(
-        public readonly feature: 'autocompletions' | 'chat messages and commands',
+        public readonly feature: 'autocompletions' | 'chat messages and commands' | 'Agentic Chat',
         public readonly message: string,
         /* Whether an upgrade is available that would increase rate limits. */
         public readonly upgradeIsAvailable: boolean,
@@ -33,12 +33,13 @@ export class RateLimitError extends Error {
         public readonly retryAfter?: string | null
     ) {
         super(message)
-        this.userMessage = `You've used all ${feature} for ${
-            upgradeIsAvailable ? 'the month' : 'today'
-        }.`
+        this.userMessage =
+            feature === 'Agentic Chat'
+                ? `You've reached the daily limit for Agentic Chat.`
+                : `You've used all of your ${feature} for ${upgradeIsAvailable ? 'the month' : 'today'}.`
         this.retryAfterDate = retryAfter
             ? /^\d+$/.test(retryAfter)
-                ? new Date(Date.now() + parseInt(retryAfter, 10) * 1000)
+                ? new Date(Date.now() + Number.parseInt(retryAfter, 10) * 1000)
                 : new Date(retryAfter)
             : undefined
         this.retryMessage = this.retryAfterDate ? formatRetryAfterDate(this.retryAfterDate) : undefined
@@ -55,6 +56,10 @@ export function isRateLimitError(error: unknown): error is RateLimitError {
     return error instanceof RateLimitError || (error as any)?.name === RateLimitError.errorName
 }
 
+export function isContextWindowLimitError(error: unknown): error is Error {
+    return error instanceof Error && error.message.includes('token limit')
+}
+
 export class TracedError extends Error {
     constructor(
         message: string,
@@ -68,7 +73,7 @@ export class NetworkError extends Error {
     public readonly status: number
 
     constructor(
-        response: BrowserOrNodeResponse,
+        response: Pick<BrowserOrNodeResponse, 'url' | 'status' | 'statusText'>,
         content: string,
         public traceId: string | undefined
     ) {
@@ -97,12 +102,36 @@ export function isAbortError(error: unknown): error is AbortError {
         isError(error) &&
         // custom abort error
         ((error instanceof AbortError && error.isAbortError) ||
+            error.name === 'AbortError' ||
+            ('type' in error && error.type === 'aborted') ||
             // http module
             error.message === 'aborted' ||
             // fetch
             error.message.includes('The operation was aborted') ||
+            error.message === 'This operation was aborted' ||
             error.message.includes('The user aborted a request'))
     )
 }
 
+export function isAbortErrorOrSocketHangUp(error: unknown): error is Error {
+    return Boolean(
+        isAbortError(error) ||
+            (error && (error as any).message === 'socket hang up') ||
+            (error && (error as any).message === 'aborted') ||
+            error === 'aborted'
+    )
+}
+
 export class TimeoutError extends Error {}
+
+export function isNetworkLikeError(error: Error): boolean {
+    const message = error.message
+    return (
+        message.includes('ENOTFOUND') ||
+        message.includes('ECONNREFUSED') ||
+        message.includes('ECONNRESET') ||
+        message.includes('EHOSTUNREACH') ||
+        message.includes('ETIMEDOUT') ||
+        message.includes('SELF_SIGNED_CERT_IN_CHAIN')
+    )
+}

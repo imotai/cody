@@ -1,118 +1,229 @@
-import * as vscode from 'vscode'
-
+import {
+    type Unsubscribable,
+    createDisposables,
+    firstValueFrom,
+    isDefined,
+} from '@sourcegraph/cody-shared'
+import type { Observable } from 'observable-fns'
+import type * as vscode from 'vscode'
 import type { ContextRetriever } from '../types'
-
-import type { BfgRetriever } from './retrievers/bfg/bfg-retriever'
 import { JaccardSimilarityRetriever } from './retrievers/jaccard-similarity/jaccard-similarity-retriever'
-import { JaccardSimilarityRetriever as NewJaccardSimilarityRetriever } from './retrievers/new-jaccard-similarity/jaccard-similarity-retriever'
-import { SectionHistoryRetriever } from './retrievers/section-history/section-history-retriever'
+import { LspLightRetriever } from './retrievers/lsp-light/lsp-light-retriever'
+import { DiagnosticsRetriever } from './retrievers/recent-user-actions/diagnostics-retriever'
+import { RecentCopyRetriever } from './retrievers/recent-user-actions/recent-copy'
+import { LineLevelDiffStrategy } from './retrievers/recent-user-actions/recent-edits-diff-helpers/line-level-diff'
+import { UnifiedDiffStrategy } from './retrievers/recent-user-actions/recent-edits-diff-helpers/unified-diff'
+import { RecentEditsRetriever } from './retrievers/recent-user-actions/recent-edits-retriever'
+import { RecentViewPortRetriever } from './retrievers/recent-user-actions/recent-view-port'
+import { loadTscRetriever } from './retrievers/tsc/load-tsc-retriever'
 
 export type ContextStrategy =
-    | 'bfg'
+    | 'lsp-light'
     | 'jaccard-similarity'
     | 'new-jaccard-similarity'
-    | 'bfg-mixed'
-    | 'local-mixed'
+    | 'tsc'
+    | 'tsc-mixed'
     | 'none'
+    | 'recent-edits'
+    | 'recent-edits-1m'
+    | 'recent-edits-5m'
+    | 'recent-edits-mixed'
+    | 'recent-copy'
+    | 'diagnostics'
+    | 'recent-view-port'
+    | 'auto-edit'
 
 export interface ContextStrategyFactory extends vscode.Disposable {
-    getStrategy(document: vscode.TextDocument): { name: ContextStrategy; retrievers: ContextRetriever[] }
+    getStrategy(
+        document: vscode.TextDocument
+    ): Promise<{ name: ContextStrategy; retrievers: ContextRetriever[] }>
 }
 
 export class DefaultContextStrategyFactory implements ContextStrategyFactory {
-    private disposables: vscode.Disposable[] = []
+    private contextStrategySubscription: Unsubscribable
 
-    private localRetriever: ContextRetriever | undefined
+    private allLocalRetrievers: ContextRetriever[] | undefined
     private graphRetriever: ContextRetriever | undefined
 
-    constructor(
-        private contextStrategy: ContextStrategy,
-        createBfgRetriever?: () => BfgRetriever
-    ) {
-        switch (contextStrategy) {
-            case 'none':
-                break
-            case 'bfg-mixed':
-            case 'bfg':
-                // The bfg strategy uses jaccard similarity as a fallback if no results are found or
-                // the language is not supported by BFG
-                this.localRetriever = new JaccardSimilarityRetriever()
-                this.disposables.push(this.localRetriever)
-                if (createBfgRetriever) {
-                    this.graphRetriever = createBfgRetriever()
-                    this.disposables.push(this.graphRetriever)
-                }
-                break
-            case 'jaccard-similarity':
-                this.localRetriever = new JaccardSimilarityRetriever()
-                this.disposables.push(this.localRetriever)
-                break
-            case 'new-jaccard-similarity':
-                this.localRetriever = new NewJaccardSimilarityRetriever()
-                this.disposables.push(this.localRetriever)
-                break
-            case 'local-mixed':
-                this.localRetriever = new JaccardSimilarityRetriever()
-                // Filling the graphRetriever field with another local retriever but that's alright
-                // we simply mix them later anyways.
-                this.graphRetriever = SectionHistoryRetriever.createInstance()
-                this.disposables.push(this.localRetriever, this.graphRetriever)
-        }
+    constructor(private contextStrategy: Observable<ContextStrategy>) {
+        this.contextStrategySubscription = contextStrategy
+            .pipe(
+                createDisposables(contextStrategy => {
+                    switch (contextStrategy) {
+                        case 'none':
+                            break
+                        case 'recent-edits':
+                            this.allLocalRetrievers = [
+                                new RecentEditsRetriever({
+                                    maxAgeMs: 60 * 1000,
+                                    diffStrategyList: [
+                                        new UnifiedDiffStrategy({ addLineNumbers: false }),
+                                    ],
+                                }),
+                            ]
+                            break
+                        case 'recent-edits-1m':
+                            this.allLocalRetrievers = [
+                                new RecentEditsRetriever({
+                                    maxAgeMs: 60 * 1000,
+                                    diffStrategyList: [
+                                        new UnifiedDiffStrategy({ addLineNumbers: false }),
+                                    ],
+                                }),
+                            ]
+                            break
+                        case 'recent-edits-5m':
+                            this.allLocalRetrievers = [
+                                new RecentEditsRetriever({
+                                    maxAgeMs: 60 * 5 * 1000,
+                                    diffStrategyList: [
+                                        new UnifiedDiffStrategy({ addLineNumbers: false }),
+                                    ],
+                                }),
+                            ]
+                            break
+                        case 'recent-edits-mixed':
+                            this.allLocalRetrievers = [
+                                new RecentEditsRetriever({
+                                    maxAgeMs: 60 * 1000,
+                                    diffStrategyList: [
+                                        new UnifiedDiffStrategy({ addLineNumbers: false }),
+                                    ],
+                                }),
+                                new JaccardSimilarityRetriever(),
+                            ]
+                            break
+                        case 'tsc-mixed':
+                            this.allLocalRetrievers = [new JaccardSimilarityRetriever()]
+                            this.graphRetriever = loadTscRetriever()
+                            break
+                        case 'tsc':
+                            this.graphRetriever = loadTscRetriever()
+                            break
+                        case 'lsp-light':
+                            this.allLocalRetrievers = [new JaccardSimilarityRetriever()]
+                            this.graphRetriever = new LspLightRetriever()
+                            break
+                        case 'recent-copy':
+                            this.allLocalRetrievers = [
+                                new RecentCopyRetriever({
+                                    maxAgeMs: 60 * 1000,
+                                    maxSelections: 100,
+                                }),
+                            ]
+                            break
+                        case 'diagnostics':
+                            this.allLocalRetrievers = [
+                                new DiagnosticsRetriever({
+                                    contextLines: 0,
+                                    useXMLForPromptRendering: true,
+                                }),
+                            ]
+                            break
+                        case 'recent-view-port':
+                            this.allLocalRetrievers = [
+                                new RecentViewPortRetriever({
+                                    maxTrackedViewPorts: 50,
+                                    maxRetrievedViewPorts: 10,
+                                }),
+                            ]
+                            break
+                        case 'auto-edit':
+                            this.allLocalRetrievers = [
+                                new RecentEditsRetriever({
+                                    maxAgeMs: 10 * 60 * 1000,
+                                    diffStrategyList: [
+                                        new LineLevelDiffStrategy({
+                                            contextLines: 3,
+                                            longTermDiffCombinationStrategy: 'unified-diff',
+                                            minShortTermEvents: 1,
+                                            minShortTermTimeMs: 2 * 60 * 1000, // 2 minutes,
+                                            trimSurroundingContext: true,
+                                        }),
+                                    ],
+                                }),
+                                new DiagnosticsRetriever({
+                                    contextLines: 0,
+                                    useXMLForPromptRendering: false,
+                                    useCaretToIndicateErrorLocation: false,
+                                }),
+                                new RecentViewPortRetriever({
+                                    maxTrackedViewPorts: 50,
+                                    maxRetrievedViewPorts: 10,
+                                }),
+                            ]
+                            break
+                        case 'jaccard-similarity':
+                            this.allLocalRetrievers = [new JaccardSimilarityRetriever()]
+                            break
+                    }
+                    return [
+                        ...(this.allLocalRetrievers ?? []),
+                        this.graphRetriever,
+                        {
+                            dispose: () => {
+                                this.allLocalRetrievers = undefined
+                                this.graphRetriever = undefined
+                            },
+                        },
+                    ].filter(isDefined)
+                })
+            )
+            .subscribe(() => {})
     }
 
-    public getStrategy(document: vscode.TextDocument): {
+    public async getStrategy(document: vscode.TextDocument): Promise<{
         name: ContextStrategy
         retrievers: ContextRetriever[]
-    } {
+    }> {
         const retrievers: ContextRetriever[] = []
-
-        switch (this.contextStrategy) {
+        const contextStrategy = await firstValueFrom(this.contextStrategy)
+        switch (contextStrategy) {
             case 'none': {
                 break
             }
 
-            // The bfg strategy exclusively uses bfg strategy when the language is supported
-            case 'bfg':
-                if (this.graphRetriever?.isSupportedForLanguageId(document.languageId)) {
-                    retrievers.push(this.graphRetriever)
-                } else if (this.localRetriever) {
-                    retrievers.push(this.localRetriever)
-                }
-                break
-
-            // The bfg mixed strategy mixes local and graph based retrievers
-            case 'bfg-mixed':
+            // The lsp-light strategy mixes local and graph based retrievers
+            case 'lsp-light': {
                 if (this.graphRetriever?.isSupportedForLanguageId(document.languageId)) {
                     retrievers.push(this.graphRetriever)
                 }
-                if (this.localRetriever) {
-                    retrievers.push(this.localRetriever)
+                if (this.allLocalRetrievers) {
+                    retrievers.push(...this.allLocalRetrievers)
                 }
                 break
+            }
 
-            // The local mixed strategy combines two local retrievers
-            case 'local-mixed':
-                if (this.localRetriever) {
-                    retrievers.push(this.localRetriever)
-                }
-                if (this.graphRetriever) {
+            case 'tsc':
+            case 'tsc-mixed':
+                if (this.graphRetriever?.isSupportedForLanguageId(document.languageId)) {
                     retrievers.push(this.graphRetriever)
+                }
+                if (this.allLocalRetrievers) {
+                    retrievers.push(...this.allLocalRetrievers)
                 }
                 break
 
             // The jaccard similarity strategies only uses the local retriever
             case 'jaccard-similarity':
-            case 'new-jaccard-similarity': {
-                if (this.localRetriever) {
-                    retrievers.push(this.localRetriever)
+            case 'recent-edits':
+            case 'recent-edits-1m':
+            case 'recent-edits-5m':
+            case 'recent-copy':
+            case 'diagnostics':
+            case 'recent-view-port':
+            case 'auto-edit':
+            case 'recent-edits-mixed': {
+                if (this.allLocalRetrievers) {
+                    retrievers.push(...this.allLocalRetrievers)
                 }
                 break
             }
         }
-        return { name: this.contextStrategy, retrievers }
+        return { name: contextStrategy, retrievers }
     }
 
     public dispose(): void {
-        vscode.Disposable.from(...this.disposables).dispose()
+        this.contextStrategySubscription.unsubscribe()
     }
 }

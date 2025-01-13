@@ -1,20 +1,19 @@
 import * as vscode from 'vscode'
 
 import {
-    DOTCOM_URL,
-    type Configuration,
-    type ConfigurationUseContext,
-    type ConfigurationWithAccessToken,
+    type ClientConfiguration,
+    CodyAutoSuggestionMode,
+    type CodyIDE,
+    OLLAMA_DEFAULT_URL,
+    type PickResolvedConfiguration,
+    PromptString,
+    cenv,
+    setStaticResolvedConfigurationValue,
 } from '@sourcegraph/cody-shared'
 
-import {
-    CONFIG_KEY,
-    getConfigEnumValues,
-    type ConfigKeys,
-    type ConfigurationKeysMap,
-} from './configuration-keys'
+import type { ChatModelProviderConfig } from '@sourcegraph/cody-shared/src/models/sync'
+import { CONFIG_KEY, type ConfigKeys } from './configuration-keys'
 import { localStorage } from './services/LocalStorageProvider'
-import { getAccessToken } from './services/SecretStorageProvider'
 
 interface ConfigGetter {
     get<T>(section: (typeof CONFIG_KEY)[ConfigKeys], defaultValue?: T): T
@@ -25,9 +24,7 @@ interface ConfigGetter {
  */
 export function getConfiguration(
     config: ConfigGetter = vscode.workspace.getConfiguration()
-): Configuration {
-    const isTesting = process.env.CODY_TESTING === 'true'
-
+): ClientConfiguration {
     function getHiddenSetting<T>(configKey: string, defaultValue?: T): T {
         return config.get<T>(`cody.${configKey}` as any, defaultValue)
     }
@@ -50,86 +47,114 @@ export function getConfiguration(
         debugRegex = /.*/
     }
 
-    let autocompleteAdvancedProvider: Configuration['autocompleteAdvancedProvider'] = config.get(
-        CONFIG_KEY.autocompleteAdvancedProvider,
-        null
+    let codyAutoSuggestionsMode = config.get<string>(
+        CONFIG_KEY.suggestionsMode,
+        CodyAutoSuggestionMode.Autocomplete
     )
-    // Handle the old `unstable-fireworks` option
-    if (autocompleteAdvancedProvider === 'unstable-fireworks') {
-        autocompleteAdvancedProvider = 'fireworks'
+
+    // Backward compatibility with the older config for autocomplete. If autocomplete was turned off - override the suggestion mode to "off".
+    // TODO (Hitesh): Remove the manual override once the updated config is communicated after experimental release
+    if (
+        codyAutoSuggestionsMode === CodyAutoSuggestionMode.Autocomplete &&
+        vscode.workspace.getConfiguration().get<boolean>('cody.autocomplete.enabled') === false
+    ) {
+        codyAutoSuggestionsMode = CodyAutoSuggestionMode.Off
     }
-
-    // check if the configured enum values are valid
-    const configKeys = [
-        'autocompleteAdvancedProvider',
-        'autocompleteAdvancedModel',
-    ] as (keyof ConfigurationKeysMap)[]
-
-    for (const configVal of configKeys) {
-        const key = configVal.replaceAll(/([A-Z])/g, '.$1').toLowerCase()
-        const value: string | null = config.get(CONFIG_KEY[configVal])
-        checkValidEnumValues(key, value)
-    }
-
-    const autocompleteExperimentalGraphContext: 'bfg' | null = getHiddenSetting(
-        'autocomplete.experimental.graphContext',
-        null
-    )
 
     return {
-        proxy: config.get<string | null>(CONFIG_KEY.proxy, null),
+        net: {
+            mode: config.get<string | null | undefined>(CONFIG_KEY.netMode, undefined),
+            proxy: {
+                endpoint: config.get<string | null | undefined>(CONFIG_KEY.netProxyEndpoint, undefined),
+                cacert: config.get<string | null | undefined>(CONFIG_KEY.netProxyCacert, undefined),
+                skipCertValidation: config.get<boolean | null | undefined>(
+                    CONFIG_KEY.netProxySkipCertValidation,
+                    false
+                ),
+            },
+            // this is vscode's config that we need to watch. This is because it
+            // might require us to re-try auth. Settings aren't actually used so
+            // we stringify them.
+            vscode: JSON.stringify(config.get<object>('http' as any, {})),
+        },
         codebase: sanitizeCodebase(config.get(CONFIG_KEY.codebase)),
-        customHeaders: config.get<object>(CONFIG_KEY.customHeaders, {}) as Record<string, string>,
-        useContext: config.get<ConfigurationUseContext>(CONFIG_KEY.useContext) || 'embeddings',
-        debugEnable: config.get<boolean>(CONFIG_KEY.debugEnable, false),
+        serverEndpoint: config.get<string>(CONFIG_KEY.serverEndpoint),
+        customHeaders: config.get<Record<string, string>>(CONFIG_KEY.customHeaders),
         debugVerbose: config.get<boolean>(CONFIG_KEY.debugVerbose, false),
         debugFilter: debugRegex,
         telemetryLevel: config.get<'all' | 'off'>(CONFIG_KEY.telemetryLevel, 'all'),
-        autocomplete: config.get(CONFIG_KEY.autocompleteEnabled, true),
+        autocomplete: codyAutoSuggestionsMode === CodyAutoSuggestionMode.Autocomplete,
         autocompleteLanguages: config.get(CONFIG_KEY.autocompleteLanguages, {
             '*': true,
         }),
-        chatPreInstruction: config.get(CONFIG_KEY.chatPreInstruction, ''),
+        chatPreInstruction: PromptString.fromConfig(config, CONFIG_KEY.chatPreInstruction, undefined),
+        editPreInstruction: PromptString.fromConfig(config, CONFIG_KEY.editPreInstruction, undefined),
         commandCodeLenses: config.get(CONFIG_KEY.commandCodeLenses, false),
-        editorTitleCommandIcon: config.get(CONFIG_KEY.editorTitleCommandIcon, true),
-        autocompleteAdvancedProvider,
-        autocompleteAdvancedModel: config.get<string | null>(CONFIG_KEY.autocompleteAdvancedModel, null),
+        autocompleteAdvancedProvider: config.get<ClientConfiguration['autocompleteAdvancedProvider']>(
+            CONFIG_KEY.autocompleteAdvancedProvider,
+            'default'
+        ),
         autocompleteCompleteSuggestWidgetSelection: config.get(
             CONFIG_KEY.autocompleteCompleteSuggestWidgetSelection,
             true
         ),
         autocompleteFormatOnAccept: config.get(CONFIG_KEY.autocompleteFormatOnAccept, true),
+        autocompleteDisableInsideComments: config.get(
+            CONFIG_KEY.autocompleteDisableInsideComments,
+            false
+        ),
         codeActions: config.get(CONFIG_KEY.codeActionsEnabled, true),
         commandHints: config.get(CONFIG_KEY.commandHintsEnabled, false),
+
+        /**
+         * Instance must have feature flag enabled to use this feature.
+         */
+        agenticContextExperimentalOptions: config.get(CONFIG_KEY.agenticContextExperimentalOptions, {}),
 
         /**
          * Hidden settings for internal use only.
          */
 
-        internalUnstable: getHiddenSetting('internal.unstable', isTesting),
+        internalUnstable: getHiddenSetting(
+            'internal.unstable',
+            cenv.CODY_CONFIG_ENABLE_INTERNAL_UNSTABLE
+        ),
+        internalDebugContext: getHiddenSetting('internal.debug.context', false),
+        internalDebugState: getHiddenSetting('internal.debug.state', false),
 
-        autocompleteExperimentalGraphContext,
-        experimentalSimpleChatContext: getHiddenSetting('experimental.simpleChatContext', true),
-        experimentalSymfContext: getHiddenSetting('experimental.symfContext', true),
+        autocompleteAdvancedModel: getHiddenSetting('autocomplete.advanced.model', null),
+        autocompleteExperimentalGraphContext: getHiddenSetting<
+            ClientConfiguration['autocompleteExperimentalGraphContext']
+        >('autocomplete.experimental.graphContext', null),
+        experimentalCommitMessage: getHiddenSetting('experimental.commitMessage', true),
+        experimentalNoodle: getHiddenSetting('experimental.noodle', false),
 
-        experimentalGuardrails: getHiddenSetting('experimental.guardrails', isTesting),
         experimentalTracing: getHiddenSetting('experimental.tracing', false),
 
-        autocompleteExperimentalDynamicMultilineCompletions: getHiddenSetting(
-            'autocomplete.experimental.dynamicMultilineCompletions',
+        experimentalSupercompletions: getHiddenSetting('experimental.supercompletions', false),
+        experimentalAutoEditEnabled: codyAutoSuggestionsMode === CodyAutoSuggestionMode.Autoedit,
+        experimentalAutoEditConfigOverride: getHiddenSetting(
+            'experimental.autoedit.config.override',
+            undefined
+        ),
+        experimentalAutoEditRendererTesting: getHiddenSetting(
+            'experimental.autoedit-renderer-testing',
             false
         ),
-        autocompleteExperimentalHotStreak: getHiddenSetting(
-            'autocomplete.experimental.hotStreak',
-            false
-        ),
-        autocompleteExperimentalFastPath: getHiddenSetting('autocomplete.experimental.fastPath', false),
+        experimentalMinionAnthropicKey: getHiddenSetting('experimental.minion.anthropicKey', undefined),
+        experimentalNoxideEnabled: getHiddenSetting('experimental.noxide.enabled', true),
+        experimentalGuardrailsTimeoutSeconds: getHiddenSetting('experimental.guardrailsTimeoutSeconds'),
+
         autocompleteExperimentalOllamaOptions: getHiddenSetting(
             'autocomplete.experimental.ollamaOptions',
             {
-                url: 'http://localhost:11434',
+                url: OLLAMA_DEFAULT_URL,
                 model: 'codellama:7b-code',
             }
+        ),
+        autocompleteExperimentalFireworksOptions: getHiddenSetting(
+            'autocomplete.experimental.fireworksOptions',
+            undefined
         ),
 
         // Note: In spirit, we try to minimize agent-specific code paths in the VSC extension.
@@ -137,27 +162,28 @@ export function getConfiguration(
         // when something goes wrong, and to suppress event logging in the agent.
         // Rely on this flag sparingly.
         isRunningInsideAgent: getHiddenSetting('advanced.agent.running', false),
-        agentIDE: getHiddenSetting<'VSCode' | 'JetBrains' | 'Neovim' | 'Emacs'>('advanced.agent.ide'),
-        autocompleteTimeouts: {
-            multiline: getHiddenSetting<number | undefined>(
-                'autocomplete.advanced.timeout.multiline',
-                undefined
-            ),
-            singleline: getHiddenSetting<number | undefined>(
-                'autocomplete.advanced.timeout.singleline',
-                undefined
-            ),
-        },
+        hasNativeWebview: getHiddenSetting('advanced.hasNativeWebview', true),
+        agentIDE: getHiddenSetting<CodyIDE>('advanced.agent.ide.name'),
+        agentIDEVersion: getHiddenSetting('advanced.agent.ide.version'),
+        agentExtensionVersion: getHiddenSetting('advanced.agent.extension.version'),
+        agentHasPersistentStorage: getHiddenSetting('advanced.agent.capabilities.storage', false),
+        autocompleteFirstCompletionTimeout: getHiddenSetting<number>(
+            'autocomplete.advanced.timeout.firstCompletion',
+            3_500
+        ),
+        providerLimitPrompt: getHiddenSetting<number | undefined>('provider.limit.prompt', undefined),
+        devModels: getHiddenSetting<ChatModelProviderConfig[] | undefined>('dev.models', undefined),
 
-        testingLocalEmbeddingsModel: isTesting
-            ? getHiddenSetting<string | undefined>('testing.localEmbeddings.model', undefined)
-            : undefined,
-        testingLocalEmbeddingsEndpoint: isTesting
-            ? getHiddenSetting<string | undefined>('testing.localEmbeddings.endpoint', undefined)
-            : undefined,
-        testingLocalEmbeddingsIndexLibraryPath: isTesting
-            ? getHiddenSetting<string | undefined>('testing.localEmbeddings.indexLibraryPath', undefined)
-            : undefined,
+        telemetryClientName: getHiddenSetting<string | undefined>('telemetry.clientName'),
+
+        /**
+         * Overrides always take precedence over other configuration. Specific
+         * override flags should be preferred over opaque blanket settings /
+         * environment variables such as TESTING_MODE which can make it
+         * difficult to understand the broad impact such a setting can have.
+         */
+        overrideAuthToken: getHiddenSetting<string | undefined>('override.authToken'),
+        overrideServerEndpoint: getHiddenSetting<string | undefined>('override.serverEndpoint'),
     }
 }
 
@@ -170,24 +196,21 @@ function sanitizeCodebase(codebase: string | undefined): string {
     return codebase.replace(protocolRegexp, '').trim().replace(trailingSlashRegexp, '')
 }
 
-export const getFullConfig = async (): Promise<ConfigurationWithAccessToken> => {
-    const config = getConfiguration()
-    const isTesting = process.env.CODY_TESTING === 'true'
-    const serverEndpoint =
-        localStorage?.getEndpoint() || (isTesting ? 'http://localhost:49300/' : DOTCOM_URL.href)
-    const accessToken = (await getAccessToken()) || null
-    return { ...config, accessToken, serverEndpoint }
-}
-
-function checkValidEnumValues(configName: string, value: string | null): void {
-    const validEnumValues = getConfigEnumValues(`cody.${configName}`)
-    if (value) {
-        if (!validEnumValues.includes(value)) {
-            void vscode.window.showErrorMessage(
-                `Invalid value for ${configName}: ${value}. Valid values are: ${validEnumValues.join(
-                    ', '
-                )}`
-            )
-        }
-    }
+/**
+ * Set the global {@link resolvedConfig} value with the given {@link AuthCredentials} and otherwise
+ * use global config and client state.
+ *
+ * Call this only when this value is guaranteed not to change during execution (such as in CLI
+ * programs).
+ */
+export function setStaticResolvedConfigurationWithAuthCredentials({
+    configuration,
+    auth,
+}: PickResolvedConfiguration<{ configuration: 'customHeaders'; auth: true }>): void {
+    setStaticResolvedConfigurationValue({
+        configuration: { ...getConfiguration(), customHeaders: configuration.customHeaders },
+        auth,
+        clientState: localStorage.getClientState(),
+        isReinstall: false,
+    })
 }

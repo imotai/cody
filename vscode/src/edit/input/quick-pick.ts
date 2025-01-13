@@ -18,9 +18,11 @@ interface QuickPickConfiguration {
     onDidTriggerButton?: (target: vscode.QuickInputButton) => void
 }
 
-export interface QuickPick {
+interface QuickPick {
     input: vscode.QuickPick<vscode.QuickPickItem>
-    render: (title: string, value: string) => void
+    render: (value: string) => void
+    setItems: (items: vscode.QuickPickItem[]) => void
+    hide: () => void
 }
 
 export const createQuickPick = ({
@@ -30,12 +32,13 @@ export const createQuickPick = ({
     onDidChangeActive,
     onDidChangeValue,
     onDidHide,
+    onDidTriggerButton,
     getItems,
     buttons,
-    onDidTriggerButton,
     value = '',
 }: QuickPickConfiguration): QuickPick => {
     const quickPick = vscode.window.createQuickPick()
+    quickPick.ignoreFocusOut = true
     quickPick.title = title
     quickPick.placeholder = placeHolder
     quickPick.value = value
@@ -67,8 +70,7 @@ export const createQuickPick = ({
 
     return {
         input: quickPick,
-        render: (title, value) => {
-            quickPick.title = title
+        render: value => {
             quickPick.value = value
 
             const itemsOrPromise = getItems()
@@ -90,5 +92,9 @@ export const createQuickPick = ({
 
             quickPick.show()
         },
+        setItems: (items: vscode.QuickPickItem[]) => {
+            quickPick.items = items
+        },
+        hide: () => quickPick.hide(),
     }
 }

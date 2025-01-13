@@ -1,9 +1,20 @@
-import opentelemetry, { SpanStatusCode, context, propagation, type Exception } from '@opentelemetry/api'
+import opentelemetry, {
+    type Context,
+    ROOT_CONTEXT,
+    SpanStatusCode,
+    context,
+    propagation,
+    type Span,
+} from '@opentelemetry/api'
+import type { BrowserOrNodeResponse } from '../sourcegraph-api/graphql/client'
 
 const INSTRUMENTATION_SCOPE_NAME = 'cody'
 const INSTRUMENTATION_SCOPE_VERSION = '0.1'
 
-const tracer = opentelemetry.trace.getTracer(INSTRUMENTATION_SCOPE_NAME, INSTRUMENTATION_SCOPE_VERSION)
+export const tracer = opentelemetry.trace.getTracer(
+    INSTRUMENTATION_SCOPE_NAME,
+    INSTRUMENTATION_SCOPE_VERSION
+)
 
 export function getActiveTraceAndSpanId(): { traceId: string; spanId: string } | undefined {
     const activeSpan = opentelemetry.trace.getActiveSpan()
@@ -17,31 +28,30 @@ export function getActiveTraceAndSpanId(): { traceId: string; spanId: string } |
     return undefined
 }
 
-export function wrapInActiveSpan<R>(name: string, fn: () => R): R {
+export function wrapInActiveSpan<R>(name: string, fn: (span: Span) => R): R {
     return tracer.startActiveSpan(name, (span): R => {
         const handleSuccess = (response: R): R => {
             span.setStatus({ code: SpanStatusCode.OK })
+            span.end()
             return response
         }
 
-        const catchError = (error: unknown): never => {
-            span.recordException(error as Exception)
-            span.setStatus({ code: SpanStatusCode.ERROR })
+        const handleError = (error: unknown): never => {
+            recordErrorToSpan(span, error as Error)
             throw error
         }
 
         try {
-            const response = fn()
+            const response = fn(span)
 
-            if (response instanceof Promise) {
-                return response.then(handleSuccess, catchError) as R
+            if (typeof response === 'object' && response !== null && 'then' in response) {
+                // @ts-ignore Response seems to be a Thenable
+                return response.then(handleSuccess, handleError) as R
             }
 
             return handleSuccess(response)
         } catch (error) {
-            return catchError(error)
-        } finally {
-            span.end()
+            return handleError(error)
         }
     })
 }
@@ -56,4 +66,49 @@ export function addTraceparent(headers: Headers): void {
             carrier.set(key, value)
         },
     })
+}
+
+export function logResponseHeadersToSpan(span: Span, response: BrowserOrNodeResponse) {
+    const responseHeaders: Record<string, string> = {}
+    response.headers.forEach((value, key) => {
+        responseHeaders[key] = value
+    })
+    span.addEvent('response')
+    span.setAttributes({
+        ...responseHeaders,
+        status: response.status,
+    })
+}
+
+export function getTraceparentHeaders(): { [key: string]: string } {
+    const headers: { [key: string]: string } = {}
+    propagation.inject(context.active(), headers, {
+        set(carrier, key, value) {
+            carrier[key] = value
+        },
+    })
+    return headers
+}
+
+export function recordErrorToSpan(span: Span, error: Error): Error {
+    span.recordException(error)
+    span.setStatus({ code: SpanStatusCode.ERROR })
+    span.end()
+    return error
+}
+
+// Extracts a context from a traceparent header for use in a wrapped function
+// that is called with context.with. This is useful for propagating the trace
+// context between webview and extension host.
+export function extractContextFromTraceparent(traceparent?: string | undefined | null): Context {
+    const carrier = { traceparent } as Record<string, any>
+    const getter = {
+        get(carrier: Record<string, any>, key: string) {
+            return carrier[key]
+        },
+        keys(carrier: Record<string, any>) {
+            return Object.keys(carrier)
+        },
+    }
+    return propagation.extract(ROOT_CONTEXT, carrier, getter)
 }

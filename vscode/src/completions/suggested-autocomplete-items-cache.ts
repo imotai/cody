@@ -2,8 +2,9 @@ import { LRUCache } from 'lru-cache'
 import * as uuid from 'uuid'
 import * as vscode from 'vscode'
 
-import type { DocumentContext } from './get-current-doc-context'
-import type { CompletionItemID, CompletionLogID } from './logger'
+import type { Span } from '@opentelemetry/api'
+import type { DocumentContext } from '@sourcegraph/cody-shared'
+import type { CompletionItemID, CompletionLogID } from './analytics-logger'
 import type { RequestParams } from './request-manager'
 import type { InlineCompletionItemWithAnalytics } from './text-processing/process-inline-completions'
 
@@ -14,7 +15,9 @@ interface AutocompleteItemParams {
     trackedRange: vscode.Range
     requestParams: RequestParams
     completionItem: InlineCompletionItemWithAnalytics
+    context: vscode.InlineCompletionContext
     command?: vscode.Command
+    span?: Span
 }
 
 export class AutocompleteItem extends vscode.InlineCompletionItem {
@@ -52,8 +55,28 @@ export class AutocompleteItem extends vscode.InlineCompletionItem {
      */
     public analyticsItem: InlineCompletionItemWithAnalytics
 
+    /**
+     * Eventual Open Telemetry span associated with the completion request
+     */
+    public span: Span | undefined
+
+    /**
+     * The completion context used to fetch the completion item.
+     */
+    public context: vscode.InlineCompletionContext
+
     constructor(params: AutocompleteItemParams) {
-        const { insertText, logId, range, trackedRange, requestParams, completionItem, command } = params
+        const {
+            insertText,
+            logId,
+            range,
+            trackedRange,
+            requestParams,
+            completionItem,
+            command,
+            span,
+            context,
+        } = params
 
         super(insertText, range, command)
 
@@ -62,6 +85,8 @@ export class AutocompleteItem extends vscode.InlineCompletionItem {
         this.trackedRange = trackedRange
         this.requestParams = requestParams
         this.analyticsItem = completionItem
+        this.span = span
+        this.context = context
     }
 }
 
@@ -103,7 +128,8 @@ export function analyticsItemToAutocompleteItem(
     docContext: DocumentContext,
     position: vscode.Position,
     items: InlineCompletionItemWithAnalytics[],
-    context: vscode.InlineCompletionContext
+    context: vscode.InlineCompletionContext,
+    span: Span
 ): AutocompleteItem[] {
     return items.map(item => {
         const { insertText, range } = item
@@ -132,7 +158,7 @@ export function analyticsItemToAutocompleteItem(
         const requestParams = {
             document,
             docContext,
-            selectedCompletionInfo: context.selectedCompletionInfo,
+            selectedCompletionInfo: context?.selectedCompletionInfo,
             position,
         } satisfies RequestParams
 
@@ -144,6 +170,8 @@ export function analyticsItemToAutocompleteItem(
             requestParams,
             completionItem: item,
             command,
+            span,
+            context,
         })
 
         command.arguments[0].codyCompletion = autocompleteItem

@@ -3,21 +3,31 @@ export type DefaultCodyCommands = DefaultChatCommands | DefaultEditCommands
 
 // Default Cody Commands that runs as a Chat request
 export enum DefaultChatCommands {
+    Doc = 'doc', // Generate documentation in Chat
+    Test = 'test', // Generate documentation in Chat
     Explain = 'explain', // Explain code
-    Unit = 'unit', // Generate unit tests in Chat
     Smell = 'smell', // Generate code smell report in Chat
-    Terminal = 'terminal', // Explain terminal output
+    Custom = 'custom-chat', // Run custom command in Chat
 }
 
 // Default Cody Commands that runs as an Inline Edit command
 export enum DefaultEditCommands {
     Test = 'test', // Generate unit tests with inline edit
     Doc = 'doc', // Generate documentation with inline edit
+    Edit = 'edit', // Edit code with inline edit
+    Custom = 'custom-edit', // Run custom command with inline edit
 }
 
 // The blueprint of a Cody Custom Command
 export interface CodyCommand {
-    slashCommand: string
+    /**
+     * @deprecated Use 'key' instead.
+     */
+    slashCommand?: string
+    /**
+     * key of the command, e.g. 'smell' for Code Smell
+     */
+    key: string
     prompt: string
     description?: string
     context?: CodyCommandContext
@@ -32,9 +42,8 @@ export interface CodyCommand {
  * - 'ask' mode is the default mode, run prompt in chat view
  * - 'edit' mode will run prompt with edit command which replace selection with cody's response
  * - 'insert' mode is the same as edit, it adds to the top of the selection instead of replacing selection
- * - 'file' mode create a new file with cody's response as content
  */
-type CodyCommandMode = 'ask' | 'edit' | 'insert' | 'file'
+export type CodyCommandMode = 'ask' | 'edit' | 'insert'
 
 // Type of context available for prompt building
 export interface CodyCommandContext {
@@ -70,4 +79,10 @@ export enum CustomCommandType {
     User = 'user',
 }
 
-export type DefaultCommandType = 'default' | 'experimental'
+type DefaultCommandType = 'default' | 'experimental'
+
+export interface TerminalOutputArguments {
+    name: string
+    selection?: string
+    creationOptions?: { shellPath?: string; shellArgs?: string[] }
+}
