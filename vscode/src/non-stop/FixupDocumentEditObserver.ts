@@ -1,49 +1,61 @@
 import * as vscode from 'vscode'
 
-import type { Edit, Position, Range } from './diff'
-import type { FixupFileCollection, FixupTextChanged } from './roles'
-import { updateFixedRange, updateRangeMultipleChanges, type TextChange } from './tracked-range'
-import { CodyTaskState } from './utils'
+import { isStreamedIntent } from '../edit/utils/edit-intent'
+import type { Edit } from './line-diff'
+import type { FixupActor, FixupFileCollection, FixupTextChanged } from './roles'
+import { CodyTaskState } from './state'
+import { type TextChange, updateFixedRange, updateRangeMultipleChanges } from './tracked-range'
 
-// This does some thunking to manage the two range types: diff ranges, and
-// text change ranges.
-function updateDiffRange(range: Range, changes: TextChange[]): Range {
-    return toDiffRange(
-        updateRangeMultipleChanges(toVsCodeRange(range), changes, { supportRangeAffix: true })
-    )
-}
-
-function toDiffRange(range: vscode.Range): Range {
-    return {
-        start: toDiffPosition(range.start),
-        end: toDiffPosition(range.end),
+/**
+ * Determines of a range, even if it uses different positions, exactly matches
+ * the dimensions of another range.
+ *
+ * This is used to determine if a range has materially changed in terms of content, rather than just position.
+ * This is useful information as it tells us if a user modified the range in some way.
+ */
+function matchesRangeDimensions(originalRange: vscode.Range, incomingRange: vscode.Range): boolean {
+    const originalLength = originalRange.end.line - originalRange.start.line
+    const incomingLength = incomingRange.end.line - incomingRange.start.line
+    if (originalLength !== incomingLength) {
+        // Range shifted vertically
+        return false
     }
-}
 
-function toDiffPosition(position: vscode.Position): Position {
-    return { line: position.line, character: position.character }
-}
-
-function toVsCodeRange(range: Range): vscode.Range {
-    return new vscode.Range(toVsCodePosition(range.start), toVsCodePosition(range.end))
-}
-
-function toVsCodePosition(position: Position): vscode.Position {
-    return new vscode.Position(position.line, position.character)
-}
-
-// Updates the ranges in a diff.
-function updateRanges(ranges: Range[], changes: TextChange[]): void {
-    for (let i = 0; i < ranges.length; i++) {
-        ranges[i] = updateDiffRange(ranges[i], changes)
+    if (
+        originalRange.start.character !== incomingRange.start.character ||
+        originalRange.end.character !== incomingRange.end.character
+    ) {
+        // Range shifted horizontally
+        return false
     }
+
+    return true
 }
 
-// Updates the range in an edit.
-function updateEdits(edits: Edit[], changes: TextChange[]): void {
-    for (const [i, edit] of edits.entries()) {
-        edits[i].range = updateDiffRange(edit.range, changes)
+function updateAppliedDiff(changes: TextChange[], diff: Edit[]): Edit[] {
+    const result: Edit[] = []
+
+    for (const edit of diff) {
+        const updatedRange = updateRangeMultipleChanges(edit.range, changes)
+        if (
+            edit.type === 'decoratedReplacement' &&
+            // Check if the dimensions of the replacement are unchanged, this tells us if the replacement
+            // line was modified in any way. If it has, we must discard this as we cannot reliably delete it later.
+            !matchesRangeDimensions(edit.range, updatedRange)
+        ) {
+            // We can longer be confident that it should definitely be removed.
+            // It may now contain new code that the user does not want to be discarded.
+            //
+            // Instead, we will discard this edit from the diff. This has some implications:
+            // 1. We no longer show a decoration for this line, so the previous `oldText` will no longer show.
+            // 2. We will not delete this line when the task is accepted.
+            continue
+        }
+        edit.range = updatedRange
+        result.push(edit)
     }
+
+    return result
 }
 
 /**
@@ -54,7 +66,7 @@ function updateEdits(edits: Edit[], changes: TextChange[]): void {
  * and the decorations indicating where edits will appear.
  */
 export class FixupDocumentEditObserver {
-    constructor(private readonly provider_: FixupFileCollection & FixupTextChanged) {}
+    constructor(private readonly provider_: FixupFileCollection & FixupTextChanged & FixupActor) {}
 
     public textDocumentChanged(event: vscode.TextDocumentChangeEvent): void {
         const file = this.provider_.maybeFileForUri(event.document.uri)
@@ -67,38 +79,57 @@ export class FixupDocumentEditObserver {
             // Cancel any ongoing `add` tasks on undo.
             // This is to avoid a scenario where a user is trying to undo a specific part of text, but cannot because the streamed text continues to come in as the latest addition.
             if (
-                task.state === CodyTaskState.inserting &&
+                task.state === CodyTaskState.Inserting &&
                 event.reason === vscode.TextDocumentChangeReason.Undo
             ) {
-                this.provider_.cancelTask(task)
+                this.provider_.cancel(task)
                 continue
             }
 
-            for (const edit of event.contentChanges) {
-                if (
-                    edit.range.end.isBefore(task.selectionRange.start) ||
-                    edit.range.start.isAfter(task.selectionRange.end)
-                ) {
-                    continue
-                }
-                this.provider_.textDidChange(task)
-                break
-            }
             const changes = new Array<TextChange>(...event.contentChanges)
+            if (task.state === CodyTaskState.Applied && task.diff) {
+                task.diff = updateAppliedDiff(changes, task.diff)
+            }
+
+            const changeWithinRange = changes.some(
+                edit =>
+                    !(
+                        edit.range.end.isBefore(task.selectionRange.start) ||
+                        edit.range.start.isAfter(task.selectionRange.end)
+                    )
+            )
+            if (changeWithinRange) {
+                this.provider_.textDidChange(task)
+            }
+
             const updatedRange = updateRangeMultipleChanges(task.selectionRange, changes, {
                 supportRangeAffix: true,
             })
-            if (task.diff) {
-                updateRanges(task.diff.conflicts, changes)
-                updateEdits(task.diff.edits, changes)
-                updateRanges(task.diff.highlights, changes)
-                // Note, we may not notify the decorator of range changes here
-                // if the gross range has not changed. That is OK because
-                // VScode moves decorations and we can reproduce them lazily.
-            }
-            if (!updatedRange.isEqual(task.selectionRange)) {
+
+            /**
+             * Currently `updateRangeMultipleChanges` will collapse a range (it will be empty)
+             * if the entire contents of the range are replaced. This happens regularly for streamed
+             * insertions as we replace the full range with the latest LLM response as we receive it.
+             *
+             * TODO: Instead of collapsing the range, `updateRangeMultipleChanges` should expand to match
+             * the new contents.
+             */
+            const isCollapsedInsertion = isStreamedIntent(task.intent) && updatedRange.isEmpty
+
+            if (!isCollapsedInsertion && !updatedRange.isEqual(task.selectionRange)) {
                 task.selectionRange = updatedRange
                 this.provider_.rangeDidChange(task)
+            }
+
+            if (task.insertionPoint) {
+                const updatedInsertionPoint = updateRangeMultipleChanges(
+                    new vscode.Range(task.insertionPoint, task.insertionPoint),
+                    changes,
+                    { supportRangeAffix: true }
+                ).start
+                if (!updatedInsertionPoint.isEqual(task.insertionPoint)) {
+                    task.insertionPoint = updatedInsertionPoint
+                }
             }
 
             // We keep track of where the original range should be, so we can re-use it for retries.

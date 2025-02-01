@@ -2,139 +2,99 @@ import {
     MockServerTelemetryRecorderProvider,
     NoOpTelemetryRecorderProvider,
     TelemetryRecorderProvider,
-    type ConfigurationWithAccessToken,
-    type LogEventMode,
-    type TelemetryRecorder,
+    clientCapabilities,
+    resolvedConfig,
+    subscriptionDisposable,
+    telemetryRecorder,
+    telemetryRecorderProvider,
+    updateGlobalTelemetryInstances,
 } from '@sourcegraph/cody-shared'
-import { CallbackTelemetryProcessor, TimestampTelemetryProcessor } from '@sourcegraph/telemetry'
+import { TimestampTelemetryProcessor } from '@sourcegraph/telemetry/dist/processors/timestamp'
 
-import { logDebug } from '../log'
-
+import type { Disposable } from 'vscode'
+import { logDebug } from '../output-channel-logger'
 import { localStorage } from './LocalStorageProvider'
-import { getExtensionDetails } from './telemetry'
-
-let telemetryRecorderProvider: TelemetryRecorderProvider | undefined
-
-/**
- * Recorder for recording telemetry events in the new telemetry framework:
- * https://sourcegraph.com/docs/dev/background-information/telemetry
- *
- * See GraphQLTelemetryExporter to learn more about how events are exported
- * when recorded using the new recorder.
- *
- * The default recorder throws an error if it is used before initialization
- * via createOrUpdateTelemetryRecorderProvider.
- */
-export let telemetryRecorder: TelemetryRecorder = new NoOpTelemetryRecorderProvider().getRecorder([
-    new CallbackTelemetryProcessor(() => {
-        if (!process.env.VITEST) {
-            throw new Error('telemetry-v2: recorder used before initialization')
-        }
-    }),
-])
-
-/**
- * For legacy events export, where we are connected to a pre-5.2.0 instance,
- * the current strategy is to manually instrument a callsite the legacy logEvent
- * clients as well, and that will report events directly to dotcom. To avoid
- * duplicating the data, when we are doing a legacy export, we only send events
- * to the connected instance.
- *
- * In the future, when we remove the legacy event-logging clients, we should
- * change this back to 'all' so that legacy instances report events to
- * dotcom as well through the new clients.
- */
-const legacyBackcompatLogEventMode: LogEventMode = 'connected-instance-only'
 
 const debugLogLabel = 'telemetry-v2'
-
-function updateGlobalInstances(updatedProvider: TelemetryRecorderProvider & { noOp?: boolean }): void {
-    telemetryRecorderProvider?.unsubscribe()
-    telemetryRecorderProvider = updatedProvider
-    telemetryRecorder = updatedProvider.getRecorder([
-        // Log all events in debug for reference.
-        new CallbackTelemetryProcessor(event => {
-            logDebug(
-                debugLogLabel,
-                `recordEvent${updatedProvider.noOp ? ' (no-op)' : ''}: ${event.feature}/${
-                    event.action
-                }: ${JSON.stringify({
-                    parameters: event.parameters,
-                    timestamp: event.timestamp,
-                })}`
-            )
-        }),
-    ])
-}
 
 /**
  * Initializes or configures new event-recording globals, which leverage the
  * new telemetry framework:
  * https://sourcegraph.com/docs/dev/background-information/telemetry
  */
-export async function createOrUpdateTelemetryRecorderProvider(
-    config: ConfigurationWithAccessToken,
+export function createOrUpdateTelemetryRecorderProvider(
     /**
      * Hardcode isExtensionModeDevOrTest to false to test real exports - when
      * true, exports are logged to extension output instead.
      */
     isExtensionModeDevOrTest: boolean
-): Promise<void> {
-    const extensionDetails = getExtensionDetails(config)
+): Disposable {
+    return subscriptionDisposable(
+        resolvedConfig.subscribe(({ configuration, auth, clientState, isReinstall }) => {
+            // Add timestamp processor for realistic data in output for dev or no-op scenarios
+            const defaultNoOpProvider = new NoOpTelemetryRecorderProvider([
+                new TimestampTelemetryProcessor(),
+            ])
 
-    // Add timestamp processor for realistic data in output for dev or no-op scenarios
-    const defaultNoOpProvider = new NoOpTelemetryRecorderProvider([new TimestampTelemetryProcessor()])
+            if (configuration.telemetryLevel === 'off') {
+                updateGlobalTelemetryInstances(defaultNoOpProvider)
+                return
+            }
 
-    if (
-        config.telemetryLevel === 'off' ||
-        !extensionDetails.ide ||
-        extensionDetails.ideExtensionType !== 'Cody'
-    ) {
-        updateGlobalInstances(defaultNoOpProvider)
-        return
-    }
+            const initialize = telemetryRecorderProvider === undefined
 
-    const { anonymousUserID, created: newAnonymousUser } = await localStorage.anonymousUserID()
-    const initialize = telemetryRecorderProvider === undefined
-
-    /**
-     * In testing, send events to the mock server.
-     */
-    if (process.env.CODY_TESTING === 'true') {
-        logDebug(debugLogLabel, 'using mock exporter')
-        updateGlobalInstances(
-            new MockServerTelemetryRecorderProvider(extensionDetails, config, anonymousUserID)
-        )
-    } else if (isExtensionModeDevOrTest) {
-        logDebug(debugLogLabel, 'using no-op exports')
-        updateGlobalInstances(defaultNoOpProvider)
-    } else {
-        updateGlobalInstances(
-            new TelemetryRecorderProvider(
-                extensionDetails,
-                config,
-                anonymousUserID,
-                legacyBackcompatLogEventMode
-            )
-        )
-    }
-
-    /**
-     * On first initialization, also record some initial events.
-     */
-    if (initialize) {
-        if (newAnonymousUser) {
             /**
-             * New user
+             * In testing, send events to the mock server.
              */
-            telemetryRecorder.recordEvent('cody.extension', 'installed')
-        } else if (!config.isRunningInsideAgent) {
+            if (process.env.CODY_TESTING === 'true') {
+                logDebug(debugLogLabel, 'using mock exporter')
+                updateGlobalTelemetryInstances(
+                    new MockServerTelemetryRecorderProvider({
+                        configuration,
+                        clientState,
+                    })
+                )
+            } else if (isExtensionModeDevOrTest) {
+                logDebug(debugLogLabel, 'using no-op exports')
+                updateGlobalTelemetryInstances(defaultNoOpProvider)
+            } else {
+                updateGlobalTelemetryInstances(
+                    new TelemetryRecorderProvider({ configuration, auth, clientState })
+                )
+            }
+
             /**
-             * Repeat user
+             * On first initialization, also record some initial events.
+             * Skip any init events for Cody Web use case.
              */
-            telemetryRecorder.recordEvent('cody.extension', 'savedLogin')
-        }
-    }
+            const newAnonymousUser = localStorage.checkIfCreatedAnonymousUserID()
+            if (initialize && !clientCapabilities().isCodyWeb) {
+                if (newAnonymousUser || isReinstall) {
+                    /**
+                     * New user
+                     */
+                    telemetryRecorder.recordEvent(
+                        'cody.extension',
+                        isReinstall ? 'reinstalled' : 'installed',
+                        {
+                            billingMetadata: {
+                                product: 'cody',
+                                category: 'billable',
+                            },
+                        }
+                    )
+                } else if (
+                    !configuration.isRunningInsideAgent ||
+                    configuration.agentHasPersistentStorage
+                ) {
+                    /**
+                     * Repeat user
+                     */
+                    telemetryRecorder.recordEvent('cody.extension', 'savedLogin')
+                }
+            }
+        })
+    )
 }
 
 /**
@@ -142,7 +102,9 @@ export async function createOrUpdateTelemetryRecorderProvider(
  * that collects the keys of an object where the corresponding value is of a
  * given type as a type.
  */
-type KeysWithNumericValues<T> = keyof { [P in keyof T as T[P] extends number ? P : never]: P }
+type KeysWithNumericOrBooleanValues<T> = keyof {
+    [P in keyof T as T[P] extends number | boolean ? P : never]: P
+}
 
 /**
  * splitSafeMetadata is a helper for legacy telemetry helpers that accept typed
@@ -163,7 +125,7 @@ type KeysWithNumericValues<T> = keyof { [P in keyof T as T[P] extends number ? P
 export function splitSafeMetadata<Properties extends { [key: string]: any }>(
     properties: Properties
 ): {
-    metadata: { [key in KeysWithNumericValues<Properties>]: number }
+    metadata: { [key in KeysWithNumericOrBooleanValues<Properties>]: number }
     privateMetadata: { [key in keyof Properties]?: any }
 } {
     const safe: { [key in keyof Properties]?: number } = {}
@@ -202,7 +164,7 @@ export function splitSafeMetadata<Properties extends { [key: string]: any }>(
         // We know we've constructed an object with only numeric values, so
         // we cast it into the desired type where all the keys with number values
         // are present. Unit tests ensures this property holds.
-        metadata: safe as { [key in KeysWithNumericValues<Properties>]: number },
+        metadata: safe as { [key in KeysWithNumericOrBooleanValues<Properties>]: number },
         privateMetadata: unsafe,
     }
 }

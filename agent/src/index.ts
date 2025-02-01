@@ -1,4 +1,7 @@
+#!/usr/bin/env node
+
 import type { Command } from 'commander'
+import { registerLocalCertificates } from './certs'
 
 console.log = console.error
 
@@ -8,13 +11,21 @@ console.log = console.error
 // process.stdout, which breaks the `jsonrpc` command, which uses stdout/stdin
 // to communicate with the agent client`jsonrpc` command, which uses
 // stdout/stdin to communicate with the agent client.
-const rootCommand: Command = require('./cli/root').rootCommand
+const rootCommand: Command = require('./cli/command-root').rootCommand
+
+process.on('uncaughtException', e => {
+    // By default, an uncaught exception will take down the entire process.
+    // Instead of taking down the process, we just report it to stderr and move
+    // on.  In almost all cases, an uncaught exception is an innocent error that
+    // does not have to take down the process. For example, if a telemetry
+    // request fails, then it's totally fine to just report it here with a stack
+    // trace so we can look into it and fix it.
+    console.error('Uncaught exception:', e)
+})
+
+registerLocalCertificates()
 
 const args = process.argv.slice(2)
-const { operands } = rootCommand.parseOptions(args)
-if (operands.length === 0) {
-    args.push('jsonrpc')
-}
 
 rootCommand.parseAsync(args, { from: 'user' }).catch(error => {
     console.error('Error:', error)

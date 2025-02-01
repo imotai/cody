@@ -1,8 +1,14 @@
-import { describe, expect, it } from 'vitest'
+import { assert, describe, expect, it } from 'vitest'
 import type * as vscode from 'vscode'
 
-import type { Configuration } from '@sourcegraph/cody-shared'
+import {
+    type ClientConfiguration,
+    CodyAutoSuggestionMode,
+    OLLAMA_DEFAULT_URL,
+    ps,
+} from '@sourcegraph/cody-shared'
 
+import type { ChatModelProviderConfig } from '@sourcegraph/cody-shared/src/models/sync'
 import { getConfiguration } from './configuration'
 import { DEFAULT_VSCODE_SETTINGS } from './testutils/mocks'
 
@@ -20,42 +26,26 @@ describe('getConfiguration', () => {
                 switch (key) {
                     case 'cody.serverEndpoint':
                         return 'http://example.com'
-                    case 'cody.proxy':
-                        return 'socks5://127.0.0.1:9999'
                     case 'cody.codebase':
                         return 'my/codebase'
-                    case 'cody.useContext':
-                        return 'keyword'
                     case 'cody.customHeaders':
                         return {
                             'Cache-Control': 'no-cache',
                             'Proxy-Authenticate': 'Basic',
                         }
-                    case 'cody.autocomplete.enabled':
-                        return false
+                    case 'cody.suggestions.mode':
+                        return CodyAutoSuggestionMode.Off
                     case 'cody.autocomplete.languages':
                         return { '*': true }
                     case 'cody.commandCodeLenses':
-                        return true
-                    case 'cody.editorTitleCommandIcon':
-                        return true
-                    case 'cody.experimental.guardrails':
                         return true
                     case 'cody.codeActions.enabled':
                         return true
                     case 'cody.commandHints.enabled':
                         return true
-                    case 'cody.experimental.localSymbols':
-                        return true
-                    case 'cody.experimental.symf.path':
-                        return '/usr/local/bin/symf'
-                    case 'cody.experimental.simpleChatContext':
-                        return true
-                    case 'cody.experimental.symfContext':
-                        return true
                     case 'cody.experimental.tracing':
                         return true
-                    case 'cody.debug.enable':
+                    case 'cody.experimental.commitMessage':
                         return true
                     case 'cody.debug.verbose':
                         return true
@@ -63,10 +53,14 @@ describe('getConfiguration', () => {
                         return /.*/
                     case 'cody.telemetry.level':
                         return 'off'
+                    case 'cody.telemetry.clientName':
+                        return undefined
                     case 'cody.chat.preInstruction':
                         return 'My name is Jeff.'
+                    case 'cody.edit.preInstruction':
+                        return 'My name is not Jeff.'
                     case 'cody.autocomplete.advanced.provider':
-                        return 'unstable-openai'
+                        return 'default'
                     case 'cody.autocomplete.advanced.model':
                         return 'starcoder-16b'
                     case 'cody.autocomplete.advanced.timeout.multiline':
@@ -77,79 +71,141 @@ describe('getConfiguration', () => {
                         return false
                     case 'cody.autocomplete.formatOnAccept':
                         return true
-                    case 'cody.autocomplete.experimental.syntacticPostProcessing':
-                        return true
-                    case 'cody.autocomplete.experimental.dynamicMultilineCompletions':
+                    case 'cody.autocomplete.disableInsideComments':
                         return false
-                    case 'cody.autocomplete.experimental.hotStreak':
-                        return false
-                    case 'cody.autocomplete.experimental.fastPath':
-                        return false
+                    case 'cody.autocomplete.experimental.fireworksOptions':
+                        return undefined
                     case 'cody.autocomplete.experimental.ollamaOptions':
                         return {
                             model: 'codellama:7b-code',
-                            url: 'http://localhost:11434',
+                            url: OLLAMA_DEFAULT_URL,
                         }
                     case 'cody.autocomplete.experimental.graphContext':
-                        return 'bfg'
+                        return 'lsp-light'
                     case 'cody.advanced.agent.running':
                         return false
-                    case 'cody.advanced.agent.ide':
+                    case 'cody.advanced.hasNativeWebview':
+                        return true
+                    case 'cody.advanced.agent.ide.name':
+                        return undefined
+                    case 'cody.advanced.agent.ide.version':
+                        return undefined
+                    case 'cody.advanced.agent.extension.version':
                         return undefined
                     case 'cody.internal.unstable':
                         return false
+                    case 'cody.internal.debug.context':
+                        return false
+                    case 'cody.internal.debug.state':
+                        return false
+                    case 'cody.experimental.supercompletions':
+                        return false
+                    case 'cody.experimental.autoedit-renderer-testing':
+                        return false
+                    case 'cody.experimental.autoedit.config.override':
+                        return undefined
+                    case 'cody.experimental.noodle':
+                        return false
+                    case 'cody.experimental.minion.anthropicKey':
+                        return undefined
+                    case 'cody.autocomplete.advanced.timeout.firstCompletion':
+                        return 1500
+                    case 'cody.experimental.guardrailsTimeoutSeconds':
+                        return undefined
+                    case 'cody.experimental.noxide.enabled':
+                        return true
+                    case 'cody.advanced.agent.capabilities.storage':
+                        return false
+                    case 'cody.provider.limit.prompt':
+                        return 123
+                    case 'cody.dev.models':
+                        return [{ model: 'm', provider: 'p' }] satisfies ChatModelProviderConfig[]
+                    case 'cody.net.mode':
+                        return 'auto'
+                    case 'cody.net.proxy.endpoint':
+                        return 'https://localhost:8080'
+                    case 'cody.net.proxy.cacert':
+                        return '~/cody-proxy.pem'
+                    case 'cody.net.proxy.skipCertValidation':
+                        return false
+                    case 'cody.override.authToken':
+                        return undefined
+                    case 'cody.override.serverEndpoint':
+                        return undefined
+                    case 'http':
+                        return undefined
+                    case 'cody.agentic.context.experimentalShell':
+                        return false
+                    case 'cody.agentic.context.experimentalOptions':
+                        return { shell: { allow: ['git'] } }
                     default:
-                        throw new Error(`unexpected key: ${key}`)
+                        assert(false, `unexpected key: ${key}`)
                 }
             },
         }
         expect(getConfiguration(config)).toEqual({
-            proxy: 'socks5://127.0.0.1:9999',
+            net: {
+                mode: 'auto',
+                proxy: {
+                    cacert: '~/cody-proxy.pem',
+                    endpoint: 'https://localhost:8080',
+                    skipCertValidation: false,
+                },
+                vscode: undefined,
+            },
             codebase: 'my/codebase',
-            useContext: 'keyword',
+            serverEndpoint: 'http://example.com',
             customHeaders: {
                 'Cache-Control': 'no-cache',
                 'Proxy-Authenticate': 'Basic',
             },
-            chatPreInstruction: 'My name is Jeff.',
+            chatPreInstruction: ps`My name is Jeff.`,
+            editPreInstruction: ps`My name is not Jeff.`,
             autocomplete: false,
             autocompleteLanguages: {
                 '*': true,
             },
             commandCodeLenses: true,
-            experimentalSimpleChatContext: true,
-            experimentalSymfContext: true,
+            agenticContextExperimentalOptions: { shell: { allow: ['git'] } },
+            experimentalSupercompletions: false,
+            experimentalAutoEditEnabled: false,
+            experimentalAutoEditConfigOverride: undefined,
+            experimentalAutoEditRendererTesting: false,
+            experimentalMinionAnthropicKey: undefined,
             experimentalTracing: true,
-            editorTitleCommandIcon: true,
-            experimentalGuardrails: true,
+            experimentalCommitMessage: true,
+            experimentalNoodle: false,
+            experimentalNoxideEnabled: true,
             codeActions: true,
             commandHints: true,
             isRunningInsideAgent: false,
             agentIDE: undefined,
+            hasNativeWebview: true,
             internalUnstable: false,
-            debugEnable: true,
+            internalDebugContext: false,
+            internalDebugState: false,
             debugVerbose: true,
             debugFilter: /.*/,
             telemetryLevel: 'off',
-            autocompleteAdvancedProvider: 'unstable-openai',
+            agentHasPersistentStorage: false,
+            autocompleteAdvancedProvider: 'default',
             autocompleteAdvancedModel: 'starcoder-16b',
             autocompleteCompleteSuggestWidgetSelection: false,
             autocompleteFormatOnAccept: true,
-            autocompleteExperimentalDynamicMultilineCompletions: false,
-            autocompleteExperimentalHotStreak: false,
-            autocompleteExperimentalFastPath: false,
-            autocompleteExperimentalGraphContext: 'bfg',
+            autocompleteDisableInsideComments: false,
+            autocompleteExperimentalFireworksOptions: undefined,
+            autocompleteExperimentalGraphContext: 'lsp-light',
             autocompleteExperimentalOllamaOptions: {
                 model: 'codellama:7b-code',
-                url: 'http://localhost:11434',
+                url: OLLAMA_DEFAULT_URL,
             },
-            autocompleteTimeouts: {
-                multiline: undefined,
-                singleline: undefined,
-            },
-            testingLocalEmbeddingsEndpoint: undefined,
-            testingLocalEmbeddingsIndexLibraryPath: undefined,
-            testingLocalEmbeddingsModel: undefined,
-        } satisfies Configuration)
+            autocompleteFirstCompletionTimeout: 1500,
+            providerLimitPrompt: 123,
+            devModels: [{ model: 'm', provider: 'p' }],
+            experimentalGuardrailsTimeoutSeconds: undefined,
+
+            overrideAuthToken: undefined,
+            overrideServerEndpoint: undefined,
+        } satisfies ClientConfiguration)
     })
 })

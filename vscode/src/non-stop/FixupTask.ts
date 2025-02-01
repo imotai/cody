@@ -1,19 +1,31 @@
 import * as vscode from 'vscode'
 
-import type { ChatEventSource, ContextFile, ContextMessage, EditModel } from '@sourcegraph/cody-shared'
+import {
+    type ContextItem,
+    type EditModel,
+    type EventSource,
+    type PromptString,
+    ps,
+} from '@sourcegraph/cody-shared'
 
 import type { EditIntent, EditMode } from '../edit/types'
 
-import type { Diff } from './diff'
 import type { FixupFile } from './FixupFile'
-import { CodyTaskState } from './utils'
-import { getOverridenModelForIntent } from '../edit/utils/edit-models'
+import type { Edit } from './line-diff'
+import { CodyTaskState } from './state'
 
-export type taskID = string
+export type FixupTaskID = string
+
+/**
+ * Arbitrary metadata that will be included in telemetry events for this task.
+ */
+export type FixupTelemetryMetadata = {
+    [key: string]: unknown
+}
 
 export class FixupTask {
-    public id: taskID
-    public state_: CodyTaskState = CodyTaskState.idle
+    public state_: CodyTaskState = CodyTaskState.Idle
+    public diff_: Edit[] | undefined
     private stateChanges = new vscode.EventEmitter<CodyTaskState>()
     public onDidStateChange = this.stateChanges.event
     /**
@@ -32,18 +44,14 @@ export class FixupTask {
     /** The error attached to the fixup, if any */
     public error: Error | undefined
     /**
-     * If text has been received from the LLM and a diff has been computed,
-     * it is cached here. Diffs are recomputed lazily and may be stale.
+     * The original diff when the task was applied.
+     * We keep track of this as users are able to modify the diff by accepting/rejecting different parts of it.
+     * It is useful to know the state of the diff before the user started modifying it.
      */
-    public diff: Diff | undefined
+    public originalDiff: Edit[] | undefined
     /** The number of times we've submitted this to the LLM. */
     public spinCount = 0
-    /**
-     * A callback to skip formatting.
-     * We use the users' default editor formatter so it is possible that
-     * they may run into an error that we can't anticipate
-     */
-    public formattingResolver: ((value: boolean) => void) | null = null
+    public createdAt = performance.now()
 
     constructor(
         /**
@@ -52,30 +60,37 @@ export class FixupTask {
          * and will be updated by the FixupController for tasks using the 'new' mode
          */
         public fixupFile: FixupFile,
-        public readonly instruction: string,
-        public readonly userContextFiles: ContextFile[],
+        public document: vscode.TextDocument,
+        public readonly instruction: PromptString,
+        public readonly userContextItems: ContextItem[],
         /* The intent of the edit, derived from the source of the command. */
         public readonly intent: EditIntent,
+        /* The range being edited. This range is tracked and updates as the user (or Cody) edits code. */
         public selectionRange: vscode.Range,
         /* The mode indicates how code should be inserted */
         public readonly mode: EditMode,
         public readonly model: EditModel,
         /* the source of the instruction, e.g. 'code-action', 'doc', etc */
-        public source?: ChatEventSource,
-        public readonly contextMessages?: ContextMessage[],
+        public source?: EventSource,
         /* The file to write the edit to. If not provided, the edit will be applied to the fixupFile. */
-        public destinationFile?: vscode.Uri
+        public destinationFile?: vscode.Uri,
+        /* The position where the Edit should start. Defaults to the start of the selection range. */
+        public insertionPoint: vscode.Position = selectionRange.start,
+        public readonly telemetryMetadata: FixupTelemetryMetadata = {},
+        public readonly id: FixupTaskID = Date.now().toString(36).replaceAll(/\d+/g, '')
     ) {
-        this.id = Date.now().toString(36).replaceAll(/\d+/g, '')
-        this.instruction = instruction.replace(/^\/(edit|fix)/, '').trim()
-        this.originalRange = selectionRange
-        this.model = getOverridenModelForIntent(this.intent, this.model)
+        this.instruction = instruction.replace(/^\/(edit|fix)/, ps``).trim()
+        this.selectionRange = this.getDefaultSelectionRange(selectionRange)
+        this.originalRange = this.selectionRange
     }
 
     /**
      * Sets the task state. Checks the state transition is valid.
      */
     public set state(state: CodyTaskState) {
+        if (state === CodyTaskState.Error) {
+            console.log(new Error().stack)
+        }
         this.state_ = state
         this.stateChanges.fire(state)
     }
@@ -87,5 +102,90 @@ export class FixupTask {
      */
     public get state(): CodyTaskState {
         return this.state_
+    }
+
+    /**
+     * Sets the task diff. If this is the first time, it will be stored in the originalDiff property.
+     */
+    public set diff(diff: Edit[] | undefined) {
+        if (this.originalDiff === undefined) {
+            this.originalDiff = diff
+        }
+        this.diff_ = diff
+    }
+
+    /**
+     * Gets the diff of the fixup task.
+     *
+     * If text has been received from the LLM and a diff has been computed,
+     * it is cached here. Diffs are recomputed lazily and may be stale.
+     */
+    public get diff(): Edit[] | undefined {
+        return this.diff_
+    }
+
+    public removeDiffChangeByRange(range: vscode.Range): void {
+        if (this.diff) {
+            this.diff = this.diff.filter(change => !change.range.isEqual(range))
+        }
+    }
+
+    private getDefaultSelectionRange(proposedRange: vscode.Range): vscode.Range {
+        if (this.intent === 'add') {
+            // We are only adding new code, no need to expand the range
+            return proposedRange
+        }
+
+        // For all other Edits, we always expand the range to encompass all characters from the selection lines
+        // This is so we can calculate an optimal diff, and the LLM has the best chance at understanding
+        // the indentation in the returned code.
+        return new vscode.Range(proposedRange.start.line, 0, proposedRange.end.line + 1, 0)
+    }
+
+    /**
+     * Converts 'FixupTask.diff' edits into 'vscode.TextDocumentContentChangeEvent[]'
+     * format. This lets us use 'CharactersLogger' to get the same kind of metadata
+     * that we normally get from regular 'vscode.TextDocumentChangeEvent' events.
+     */
+    public getContentChanges(): vscode.TextDocumentContentChangeEvent[] {
+        if (this.diff === undefined) {
+            return []
+        }
+
+        const contentChanges = []
+        const { document } = this
+
+        for (const edit of this.diff) {
+            switch (edit.type) {
+                case 'deletion':
+                case 'decoratedReplacement':
+                    contentChanges.push({
+                        range: document.validateRange(edit.range),
+                        rangeOffset: document.offsetAt(edit.range.start),
+                        rangeLength: edit.oldText.length,
+                        text: '',
+                    })
+                    break
+                case 'insertion':
+                    contentChanges.push({
+                        // We need to check if the range is valid here.
+                        // When adding text at the end of the document,
+                        // the range might go beyond the document's bounds.
+                        // If that happens, 'CharactersLogger' would think
+                        // this change happened outside the visible ranges.
+                        //
+                        // We should consider doing that for initial ranges too.
+                        range: document.validateRange(edit.range),
+                        rangeOffset: document.offsetAt(edit.range.start),
+                        rangeLength: 0,
+                        text: edit.text,
+                    })
+                    break
+                default:
+                    throw new Error(`Unhandled edit type: ${(edit as any).type}`)
+            }
+        }
+
+        return contentChanges
     }
 }

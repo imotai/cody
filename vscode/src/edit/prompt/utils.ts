@@ -1,13 +1,18 @@
 import * as vscode from 'vscode'
 
-import type { ContextMessage } from '@sourcegraph/cody-shared'
-import type { ContextItem } from '../../prompt-builder/types'
+import type { ContextItem, ContextMessage } from '@sourcegraph/cody-shared'
 
 type ExtractableContextMessage = Required<Pick<ContextMessage, 'file'>> & ContextMessage
 
 const contextMessageToContextItem = ({ text, file }: ExtractableContextMessage): ContextItem => {
     return {
-        text: text,
+        type: 'file',
+        content: text.toString(),
+        /**
+         * Range is required on `file` to ensure we can include more than one snippet from the same
+         * file. If range is `undefined`, additional snippets from the same URI will be excluded by
+         * the context deduplication logic.
+         */
         range: file.range
             ? new vscode.Range(
                   new vscode.Position(file.range.start.line, file.range.start.character),

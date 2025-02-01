@@ -1,6 +1,6 @@
 import type { QuickPickItem } from 'vscode'
 
-import type { CodyCommandType } from '@sourcegraph/cody-shared/src/commands/types'
+import type { CodyCommandType } from '@sourcegraph/cody-shared'
 
 export enum CommandMenuAction {
     Add = 'add',
@@ -20,8 +20,15 @@ export interface CommandMenuItem extends QuickPickItem {
     type?: CodyCommandType
     // vs code command, e.g. 'cody.commands.open.json'
     command?: string
-    // cody command, e.g. '/ask'
+    /**
+     * cody command, e.g. '/ask'
+     * @deprecated Use 'commandKey' instead.
+     */
     slashCommand?: string
+    /**
+     * key of the command, e.g. 'smell' for Code Smell
+     */
+    key?: string
 }
 
 export interface ContextOption {

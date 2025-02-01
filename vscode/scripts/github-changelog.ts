@@ -4,7 +4,7 @@
  *
  * Example:
  *
- * ✨ See the [What’s new in v0.18](https://about.sourcegraph.com/blog/cody-vscode-0-18-release) blog post for what’s new in this release since v0.16 ✨
+ * ✨ See the [What’s new in v0.18](https://github.com/sourcegraph/cody/blob/main/vscode/CHANGELOG.md) changelog for what’s new in this release since v0.16 ✨
  *
  * ## v0.18.6 Changes
  *
@@ -14,8 +14,8 @@
  * **Full Changelog**: https://github.com/sourcegraph/cody/compare/vscode-v0.18.5...vscode-v0.18.6
  */
 
-import fs from 'fs'
-import path from 'path'
+import fs from 'node:fs'
+import path from 'node:path'
 
 import dedent from 'dedent'
 
@@ -93,7 +93,7 @@ function extractRepoAndNumberFromLink(
             link
         )
     if (!matches?.groups) {
-        throw new Error(`Malformed link: ${link}`)
+        return undefined
     }
     return {
         owner: matches.groups.owner,
@@ -119,10 +119,7 @@ async function main(): Promise<void> {
     const previousMinor = extractPreviousMinor(minor)
 
     const intro = dedent`
-        ✨ See the [What’s new in v${minor}](https://about.sourcegraph.com/blog/cody-vscode-${minor.replaceAll(
-            '.',
-            '-'
-        )}-0-release) blog post for what’s new in this release since v${previousMinor} ✨
+        ✨ See the [What’s new in v${minor}](https://github.com/sourcegraph/cody/blob/main/vscode/CHANGELOG.md) changelog for what’s new in this release since v${previousMinor} ✨
 
         ## v${currentVersion} Changes
     `
@@ -138,10 +135,13 @@ async function main(): Promise<void> {
 
                 const apiUrl = `https://api.github.com/repos/${owner}/${repo}/issues/${number}`
                 // @ts-ignore: Fetch is available in node :shrug:
-                const json = await fetch(apiUrl).then(res => res.json())
+                const json = await fetch(apiUrl).then(res => res.json() as any)
                 if (json?.user?.login) {
                     author = json.user.login
                 }
+            } else {
+                console.warn(`Could not extract owner/repo/number from link: ${change.link}`)
+                continue
             }
         }
 
@@ -162,5 +162,5 @@ main().catch(console.error)
 
 function extractPreviousMinor(majorAndMinor: string): string {
     const [major, minor] = majorAndMinor.split('.')
-    return `${major}.${parseInt(minor) - 1}`
+    return `${major}.${Number.parseInt(minor) - 1}`
 }

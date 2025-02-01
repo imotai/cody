@@ -1,39 +1,50 @@
+import merge from 'lodash/merge'
 import * as uuid from 'uuid'
 import type { Memento } from 'vscode'
 
-import type { ChatHistory, ChatInputHistory, UserLocalHistory } from '@sourcegraph/cody-shared'
+import {
+    type AccountKeyedChatHistory,
+    type AuthCredentials,
+    type AuthenticatedAuthStatus,
+    type ChatHistoryKey,
+    type ClientState,
+    type DefaultsAndUserPreferencesByEndpoint,
+    type LocalStorageForModelPreferences,
+    type ResolvedConfiguration,
+    type UserLocalHistory,
+    distinctUntilChanged,
+    fromVSCodeEvent,
+    startWith,
+} from '@sourcegraph/cody-shared'
+import { type Observable, map } from 'observable-fns'
+import type { AutoEditNotificationInfo } from '../../src/autoedits/autoedit-onboarding'
+import { isSourcegraphToken } from '../chat/protocol'
+import type { GitHubDotComRepoMetaData } from '../repository/githubRepoMetadata'
+import { EventEmitter } from '../testutils/mocks'
+import { secretStorage } from './SecretStorageProvider'
 
-import type { AuthStatus } from '../chat/protocol'
+export type ChatLocation = 'editor' | 'sidebar'
 
-type ChatHistoryKey = `${string}-${string}`
-type AccountKeyedChatHistory = {
-    [key: ChatHistoryKey]: PersistedUserLocalHistory
-} & {
-    // For backward compatibility, we do not want to delete the `chat` and `input` keys.
-    // As otherwise, downgrading to a prior version would completely block the startup
-    // as the client would throw.
-    //
-    // TODO: This can be removed in a future version
-    chat: ChatHistory
-    input: []
-}
-
-/**
- * Persisted chat history may contain string inputs without context
- * that we must migrate during loading.
- */
-interface PersistedUserLocalHistory {
-    chat: ChatHistory
-    input: (ChatInputHistory | string)[]
-}
-
-class LocalStorage {
+class LocalStorage implements LocalStorageForModelPreferences {
     // Bump this on storage changes so we don't handle incorrectly formatted data
     protected readonly KEY_LOCAL_HISTORY = 'cody-local-chatHistory-v2'
+    protected readonly KEY_CONFIG = 'cody-config'
+    protected readonly CODY_ENDPOINT_HISTORY = 'SOURCEGRAPH_CODY_ENDPOINT_HISTORY'
+    protected readonly CODY_ENROLLMENT_HISTORY = 'SOURCEGRAPH_CODY_ENROLLMENTS'
+    protected readonly LAST_USED_CHAT_MODALITY = 'cody-last-used-chat-modality'
+    protected readonly GIT_REPO_ACCESSIBILITY_KEY = 'cody-github-repo-metadata'
     public readonly ANONYMOUS_USER_ID_KEY = 'sourcegraphAnonymousUid'
     public readonly LAST_USED_ENDPOINT = 'SOURCEGRAPH_CODY_ENDPOINT'
-    protected readonly CODY_ENDPOINT_HISTORY = 'SOURCEGRAPH_CODY_ENDPOINT_HISTORY'
-    protected readonly KEY_LAST_USED_RECIPES = 'SOURCEGRAPH_CODY_LAST_USED_RECIPE_NAMES'
+    private readonly MODEL_PREFERENCES_KEY = 'cody-model-preferences'
+    private readonly CODY_CHAT_MEMORY = 'cody-chat-memory'
+    private readonly AUTO_EDITS_ONBOARDING_NOTIFICATION_COUNT = 'cody-auto-edit-notification-info'
+
+    public readonly keys = {
+        // LLM waitlist for the 09/12/2024 openAI o1 models
+        waitlist_o1: 'CODY_WAITLIST_LLM_09122024',
+        deepCodyLastUsedDate: 'DEEP_CODY_LAST_USED_DATE',
+        deepCodyDailyUsageCount: 'DEEP_CODY_DAILY_CHAT_USAGE',
+    }
 
     /**
      * Should be set on extension activation via `localStorage.setStorage(context.globalState)`
@@ -50,107 +61,140 @@ class LocalStorage {
         return this._storage
     }
 
-    public setStorage(storage: Memento): void {
-        this._storage = storage
+    public setStorage(storage: Memento | 'noop' | 'inMemory'): void {
+        if (storage === 'inMemory') {
+            this._storage = inMemoryEphemeralLocalStorage
+        } else if (storage === 'noop') {
+            this._storage = noopLocalStorage
+        } else {
+            this._storage = storage
+        }
+    }
+
+    public getClientState(): ClientState {
+        return {
+            lastUsedEndpoint: this.getEndpoint(),
+            anonymousUserID: this.anonymousUserID(),
+            lastUsedChatModality: this.getLastUsedChatModality(),
+            modelPreferences: this.getModelPreferences(),
+            waitlist_o1: this.get(this.keys.waitlist_o1),
+        }
+    }
+
+    private onChange = new EventEmitter<void>()
+    public get clientStateChanges(): Observable<ClientState> {
+        return fromVSCodeEvent(this.onChange.event).pipe(
+            startWith(undefined),
+            map(() => this.getClientState()),
+            distinctUntilChanged()
+        )
+    }
+
+    public async setOrDeleteWaitlistO1(value: boolean): Promise<void> {
+        if (value) {
+            await this.set(this.keys.waitlist_o1, value)
+        } else {
+            await this.delete(this.keys.waitlist_o1)
+        }
     }
 
     public getEndpoint(): string | null {
-        return this.storage.get<string | null>(this.LAST_USED_ENDPOINT, null)
+        const endpoint = this.storage.get<string | null>(this.LAST_USED_ENDPOINT, null)
+        // Clear last used endpoint if it is a Sourcegraph token
+        if (endpoint && isSourcegraphToken(endpoint)) {
+            this.deleteEndpoint(endpoint)
+            return null
+        }
+        return endpoint
     }
 
-    public async saveEndpoint(endpoint: string): Promise<void> {
-        if (!endpoint) {
+    /**
+     * Save the server endpoint to local storage *and* the access token to secret storage, but wait
+     * until both are stored to emit a change even from either. This prevents the rest of the
+     * application from reacting to one of the "store" events before the other is completed, which
+     * would give an inconsistent view of the state.
+     */
+    public async saveEndpointAndToken(
+        credentials: Pick<AuthCredentials, 'serverEndpoint' | 'accessToken' | 'tokenSource'>
+    ): Promise<void> {
+        if (!credentials.serverEndpoint) {
             return
         }
-        try {
-            const uri = new URL(endpoint).href
-            await this.storage.update(this.LAST_USED_ENDPOINT, uri)
-            await this.addEndpointHistory(uri)
-        } catch (error) {
-            console.error(error)
+        // Do not save an access token as the last-used endpoint, to prevent user mistakes.
+        if (isSourcegraphToken(credentials.serverEndpoint)) {
+            return
         }
+
+        const serverEndpoint = new URL(credentials.serverEndpoint).href
+
+        // Pass `false` to avoid firing the change event until we've stored all of the values.
+        await this.set(this.LAST_USED_ENDPOINT, serverEndpoint, false)
+        await this.addEndpointHistory(serverEndpoint, false)
+        if (credentials.accessToken) {
+            await secretStorage.storeToken(
+                serverEndpoint,
+                credentials.accessToken,
+                credentials.tokenSource
+            )
+        }
+        this.onChange.fire()
     }
 
-    public async deleteEndpoint(): Promise<void> {
-        await this.storage.update(this.LAST_USED_ENDPOINT, null)
+    public async deleteEndpoint(endpoint: string): Promise<void> {
+        await this.set(endpoint, null)
+        await this.deleteEndpointFromHistory(endpoint)
+    }
+
+    // Deletes and returns the endpoint history
+    public async deleteEndpointHistory(): Promise<string[]> {
+        const history = this.getEndpointHistory()
+        await Promise.all([
+            this.deleteEndpoint(this.LAST_USED_ENDPOINT),
+            this.set(this.CODY_ENDPOINT_HISTORY, null),
+        ])
+        return history || []
+    }
+
+    // Deletes and returns the endpoint history
+    public async deleteEndpointFromHistory(endpoint: string): Promise<void> {
+        const history = this.getEndpointHistory()
+        const historySet = new Set(history)
+        historySet.delete(endpoint)
+        await this.set(this.CODY_ENDPOINT_HISTORY, [...historySet])
     }
 
     public getEndpointHistory(): string[] | null {
-        return this.storage.get<string[] | null>(this.CODY_ENDPOINT_HISTORY, null)
+        return this.get<string[] | null>(this.CODY_ENDPOINT_HISTORY)
     }
 
-    public async deleteEndpointHistory(): Promise<void> {
-        await this.storage.update(this.CODY_ENDPOINT_HISTORY, null)
-    }
+    private async addEndpointHistory(endpoint: string, fire = true): Promise<void> {
+        // Do not save sourcegraph tokens as endpoint
+        if (isSourcegraphToken(endpoint)) {
+            return
+        }
 
-    private async addEndpointHistory(endpoint: string): Promise<void> {
         const history = this.storage.get<string[] | null>(this.CODY_ENDPOINT_HISTORY, null)
         const historySet = new Set(history)
         historySet.delete(endpoint)
         historySet.add(endpoint)
-        await this.storage.update(this.CODY_ENDPOINT_HISTORY, [...historySet])
+        await this.set(this.CODY_ENDPOINT_HISTORY, [...historySet], fire)
     }
 
-    public getChatHistory(authStatus: AuthStatus): UserLocalHistory {
-        let history = this.storage.get<AccountKeyedChatHistory | PersistedUserLocalHistory | null>(
-            this.KEY_LOCAL_HISTORY,
-            null
-        )
-        if (!history) {
-            return { chat: {}, input: [] }
-        }
-
-        const key = getKeyForAuthStatus(authStatus)
-
-        // For backwards compatibility, we upgrade the local storage key from the old layout that is
-        // not scoped to individual user accounts to be scoped instead.
-        if (history && !isMigratedChatHistory2261(history)) {
-            // HACK: We spread both parts here as TS would otherwise have issues validating the type
-            //       of AccountKeyedChatHistory. This is only three fields though.
-            history = {
-                ...{ [key]: history },
-                ...{
-                    chat: {},
-                    input: [],
-                },
-            } satisfies AccountKeyedChatHistory
-            // We use a raw write here to ensure we do not _append_ a key but actually replace
-            // existing `chat` and `input` keys.
-            // The result is not awaited to avoid changing this API to be async.
-            this.storage.update(this.KEY_LOCAL_HISTORY, history).then(() => {}, console.error)
-        }
-
-        if (!Object.hasOwn(history, key)) {
-            return { chat: {}, input: [] }
-        }
-
-        const accountHistory = (history as AccountKeyedChatHistory)[key]
-
-        // Persisted history might contain only string inputs without context so these may need converting too.
-        const inputs = accountHistory?.input
-        if (inputs?.length) {
-            let didUpdate = false
-            for (let i = 0; i < inputs.length; i++) {
-                const input = inputs[i]
-                // Convert strings to ChatInputHistory
-                if (typeof input === 'string') {
-                    inputs[i] = { inputText: input, inputContextFiles: [] }
-                    didUpdate = true
-                }
-            }
-            // Persist back to disk if we made any changes.
-            if (didUpdate) {
-                this.storage.update(this.KEY_LOCAL_HISTORY, history).then(() => {}, console.error)
-            }
-        }
-
-        return accountHistory as UserLocalHistory
+    public getChatHistory(
+        authStatus: Pick<AuthenticatedAuthStatus, 'endpoint' | 'username'>
+    ): UserLocalHistory {
+        const history = this.storage.get<AccountKeyedChatHistory | null>(this.KEY_LOCAL_HISTORY, null)
+        const accountKey = getKeyForAuthStatus(authStatus)
+        return history?.[accountKey] ?? { chat: {} }
     }
 
-    public async setChatHistory(authStatus: AuthStatus, history: UserLocalHistory): Promise<void> {
+    public async setChatHistory(
+        authStatus: Pick<AuthenticatedAuthStatus, 'endpoint' | 'username'>,
+        history: UserLocalHistory
+    ): Promise<void> {
         try {
             const key = getKeyForAuthStatus(authStatus)
-            let fullHistory = this.storage.get<{ [key: ChatHistoryKey]: UserLocalHistory } | null>(
+            let fullHistory = this.storage.get<AccountKeyedChatHistory | null>(
                 this.KEY_LOCAL_HISTORY,
                 null
             )
@@ -163,16 +207,29 @@ class LocalStorage {
                 }
             }
 
-            await this.storage.update(this.KEY_LOCAL_HISTORY, fullHistory)
-
-            // MIGRATION: Delete old/orphaned storage data from a previous migration.
-            this.migrateChatHistory2665(fullHistory as AccountKeyedChatHistory)
+            await this.set(this.KEY_LOCAL_HISTORY, fullHistory)
         } catch (error) {
             console.error(error)
         }
     }
 
-    public async deleteChatHistory(authStatus: AuthStatus, chatID: string): Promise<void> {
+    public async importChatHistory(
+        history: AccountKeyedChatHistory,
+        shouldMerge: boolean
+    ): Promise<void> {
+        if (shouldMerge) {
+            const fullHistory = this.storage.get<AccountKeyedChatHistory | null>(
+                this.KEY_LOCAL_HISTORY,
+                null
+            )
+
+            merge(history, fullHistory)
+        }
+
+        await this.storage.update(this.KEY_LOCAL_HISTORY, history)
+    }
+
+    public async deleteChatHistory(authStatus: AuthenticatedAuthStatus, chatID: string): Promise<void> {
         const userHistory = this.getChatHistory(authStatus)
         if (userHistory) {
             try {
@@ -184,55 +241,138 @@ class LocalStorage {
         }
     }
 
-    public async removeChatHistory(authStatus: AuthStatus): Promise<void> {
+    public async getAutoEditOnboardingNotificationInfo(): Promise<AutoEditNotificationInfo> {
+        return (
+            this.get<AutoEditNotificationInfo>(this.AUTO_EDITS_ONBOARDING_NOTIFICATION_COUNT) ?? {
+                lastNotifiedTime: 0,
+                timesShown: 0,
+            }
+        )
+    }
+
+    public async setAutoEditOnboardingNotificationInfo(info: AutoEditNotificationInfo): Promise<void> {
+        await this.set(this.AUTO_EDITS_ONBOARDING_NOTIFICATION_COUNT, info)
+    }
+
+    public async setGitHubRepoAccessibility(data: GitHubDotComRepoMetaData[]): Promise<void> {
+        await this.set(this.GIT_REPO_ACCESSIBILITY_KEY, data)
+    }
+
+    public getGitHubRepoAccessibility(): GitHubDotComRepoMetaData[] {
+        const ONE_DAY_IN_MS = 24 * 60 * 60 * 1000
+        const currentTime = Date.now()
+
+        return (this.get<GitHubDotComRepoMetaData[]>(this.GIT_REPO_ACCESSIBILITY_KEY) ?? []).filter(
+            ({ timestamp }) => currentTime - timestamp <= ONE_DAY_IN_MS
+        )
+    }
+
+    public async removeChatHistory(authStatus: AuthenticatedAuthStatus): Promise<void> {
         try {
-            await this.setChatHistory(authStatus, { chat: {}, input: [] })
+            await this.setChatHistory(authStatus, { chat: {} })
         } catch (error) {
             console.error(error)
         }
     }
 
     /**
-     * Return the anonymous user ID stored in local storage or create one if none exists (which
-     * occurs on a fresh installation).
+     * Gets the enrollment history for a feature from the storage.
+     *
+     * Checks if the given feature name exists in the stored enrollment
+     * history array.
+     *
+     * If not, add the feature to the memory, but return false after adding the feature
+     * so that the caller can log the first enrollment event.
      */
-    public async anonymousUserID(): Promise<{ anonymousUserID: string; created: boolean }> {
+    public getEnrollmentHistory(featureName: string): boolean {
+        const history = this.storage.get<string[]>(this.CODY_ENROLLMENT_HISTORY, [])
+        const hasEnrolled = history.includes(featureName)
+        // Log the first enrollment event
+        if (!hasEnrolled) {
+            history.push(featureName)
+            this.set(this.CODY_ENROLLMENT_HISTORY, history)
+        }
+        return hasEnrolled
+    }
+
+    /**
+     * Return the anonymous user ID stored in local storage or create one if none exists (which
+     * occurs on a fresh installation). Callers can check
+     * {@link LocalStorage.checkIfCreatedAnonymousUserID} to see if a new anonymous ID was created.
+     */
+    public anonymousUserID(): string {
         let id = this.storage.get<string>(this.ANONYMOUS_USER_ID_KEY)
-        let created = false
         if (!id) {
-            created = true
+            this.createdAnonymousUserID = true
             id = uuid.v4()
-            try {
-                await this.storage.update(this.ANONYMOUS_USER_ID_KEY, id)
-            } catch (error) {
-                console.error(error)
-            }
+            this.set(this.ANONYMOUS_USER_ID_KEY, id).catch(error => console.error(error))
         }
-        return { anonymousUserID: id, created }
+        return id
     }
 
-    public async setLastUsedCommands(commands: string[]): Promise<void> {
-        if (commands.length === 0) {
-            return
+    private createdAnonymousUserID = false
+    public checkIfCreatedAnonymousUserID(): boolean {
+        if (this.createdAnonymousUserID) {
+            this.createdAnonymousUserID = false
+            return true
         }
-        try {
-            await this.storage.update(this.KEY_LAST_USED_RECIPES, commands)
-        } catch (error) {
-            console.error(error)
-        }
+        return false
     }
 
-    public getLastUsedCommands(): string[] | null {
-        return this.storage.get<string[] | null>(this.KEY_LAST_USED_RECIPES, null)
+    public async setConfig(config: ResolvedConfiguration): Promise<void> {
+        return this.set(this.KEY_CONFIG, config)
     }
 
-    public get(key: string): string | null {
+    public getConfig(): ResolvedConfiguration | null {
+        return this.get(this.KEY_CONFIG)
+    }
+
+    public setLastUsedChatModality(modality: 'sidebar' | 'editor'): void {
+        this.set(this.LAST_USED_CHAT_MODALITY, modality)
+    }
+
+    public getLastUsedChatModality(): 'sidebar' | 'editor' {
+        return this.get(this.LAST_USED_CHAT_MODALITY) ?? 'sidebar'
+    }
+
+    public getModelPreferences(): DefaultsAndUserPreferencesByEndpoint {
+        return this.get<DefaultsAndUserPreferencesByEndpoint>(this.MODEL_PREFERENCES_KEY) ?? {}
+    }
+
+    public async setModelPreferences(preferences: DefaultsAndUserPreferencesByEndpoint): Promise<void> {
+        await this.set(this.MODEL_PREFERENCES_KEY, preferences)
+    }
+
+    public getChatMemory(): string[] | null {
+        return this.get<string[]>(this.CODY_CHAT_MEMORY) ?? null
+    }
+
+    public async setChatMemory(memories: string[] | null): Promise<void> {
+        await this.set(this.CODY_CHAT_MEMORY, memories)
+    }
+
+    public getDeepCodyUsage(): { quota: number | undefined; lastUsed: string | undefined } {
+        const quota = this.get<number>(this.keys.deepCodyDailyUsageCount) ?? undefined
+        const lastUsed = this.get<string>(this.keys.deepCodyLastUsedDate) ?? undefined
+
+        return { quota, lastUsed }
+    }
+
+    public async setDeepCodyUsage(newQuota: number, lastUsed: string): Promise<void> {
+        await this.set(this.keys.deepCodyDailyUsageCount, newQuota)
+        await this.set(this.keys.deepCodyLastUsedDate, lastUsed)
+    }
+
+    public get<T>(key: string): T | null {
         return this.storage.get(key, null)
     }
 
-    public async set(key: string, value: string): Promise<void> {
+    public async set<T>(key: string, value: T, fire = true): Promise<void> {
         try {
             await this.storage.update(key, value)
+            if (fire) {
+                this.onChange.fire()
+            }
         } catch (error) {
             console.error(error)
         }
@@ -240,22 +380,7 @@ class LocalStorage {
 
     public async delete(key: string): Promise<void> {
         await this.storage.update(key, undefined)
-    }
-
-    /**
-     * In https://github.com/sourcegraph/cody/pull/2665 we migrated the chat history key to use the
-     * user's username instead of their email address. This means that the storage would retain the chat
-     * history under the old key indefinitely. Large storage data slows down extension host activation
-     * and each `Memento#update` call, so we don't want it to linger.
-     */
-    private migrateChatHistory2665(history: AccountKeyedChatHistory): void {
-        const needsMigration = Object.keys(history).some(key => key.includes('@'))
-        if (needsMigration) {
-            const cleanedHistory = Object.fromEntries(
-                Object.entries(history).filter(([key]) => !key.includes('@'))
-            )
-            this.storage.update(this.KEY_LOCAL_HISTORY, cleanedHistory).then(() => {}, console.error)
-        }
+        this.onChange.fire()
     }
 }
 
@@ -265,17 +390,42 @@ class LocalStorage {
  */
 export const localStorage = new LocalStorage()
 
-function getKeyForAuthStatus(authStatus: AuthStatus): ChatHistoryKey {
+function getKeyForAuthStatus(
+    authStatus: Pick<AuthenticatedAuthStatus, 'endpoint' | 'username'>
+): ChatHistoryKey {
     return `${authStatus.endpoint}-${authStatus.username}`
 }
 
-/**
- * As part of #2261, we migrated the storage format of the chat history to be keyed by the current
- * user account. This checks if the new format is used by checking if any key contains a hyphen (the
- * separator between endpoint and email in the new format).
- */
-function isMigratedChatHistory2261(
-    history: AccountKeyedChatHistory | PersistedUserLocalHistory
-): history is AccountKeyedChatHistory {
-    return !!Object.keys(history).find(k => k.includes('-'))
+const noopLocalStorage = {
+    get: () => null,
+    update: () => Promise.resolve(undefined),
+} as any as Memento
+
+export function mockLocalStorage(storage: Memento | 'noop' | 'inMemory' = noopLocalStorage) {
+    localStorage.setStorage(storage)
 }
+
+class InMemoryMemento implements Memento {
+    private storage: Map<string, any> = new Map()
+
+    get<T>(key: string, defaultValue: T): T
+    get<T>(key: string): T | undefined
+    get<T>(key: string, defaultValue?: T): T | undefined {
+        return this.storage.has(key) ? this.storage.get(key) : defaultValue
+    }
+
+    update(key: string, value: any): Thenable<void> {
+        if (value === undefined) {
+            this.storage.delete(key)
+        } else {
+            this.storage.set(key, value)
+        }
+        return Promise.resolve()
+    }
+
+    keys(): readonly string[] {
+        return Array.from(this.storage.keys())
+    }
+}
+
+const inMemoryEphemeralLocalStorage = new InMemoryMemento()

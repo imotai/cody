@@ -1,6 +1,10 @@
 import { URI } from 'vscode-uri'
 
-import { hydrateAfterPostMessage } from '@sourcegraph/cody-shared'
+import {
+    type GenericVSCodeWrapper,
+    forceHydration,
+    hydrateAfterPostMessage,
+} from '@sourcegraph/cody-shared'
 
 import type { ExtensionMessage, WebviewMessage } from '../../src/chat/protocol'
 
@@ -12,12 +16,7 @@ interface VSCodeApi {
     postMessage: (message: unknown) => void
 }
 
-export interface VSCodeWrapper {
-    postMessage(message: WebviewMessage): void
-    onMessage(callback: (message: ExtensionMessage) => void): () => void
-    getState(): unknown
-    setState(newState: unknown): void
-}
+export type VSCodeWrapper = GenericVSCodeWrapper<WebviewMessage, ExtensionMessage>
 
 let api: VSCodeWrapper
 
@@ -25,7 +24,7 @@ export function getVSCodeAPI(): VSCodeWrapper {
     if (!api) {
         const vsCodeApi = acquireVsCodeApi()
         api = {
-            postMessage: message => vsCodeApi.postMessage(message),
+            postMessage: message => vsCodeApi.postMessage(forceHydration(message)),
             onMessage: callback => {
                 const listener = (event: MessageEvent<ExtensionMessage>): void => {
                     callback(hydrateAfterPostMessage(event.data, uri => URI.from(uri as any)))
@@ -38,4 +37,29 @@ export function getVSCodeAPI(): VSCodeWrapper {
         }
     }
     return api
+}
+
+export function setVSCodeWrapper(value: VSCodeWrapper): void {
+    api = value
+}
+
+let genericApi: GenericVSCodeWrapper<any, any>
+
+export function getGenericVSCodeAPI<W, E>(): GenericVSCodeWrapper<W, E> {
+    if (!genericApi) {
+        const vsCodeApi = acquireVsCodeApi()
+        genericApi = {
+            postMessage: (message: W) => vsCodeApi.postMessage(message),
+            onMessage: callback => {
+                const listener = (event: MessageEvent<E>): void => {
+                    callback(hydrateAfterPostMessage(event.data, uri => URI.from(uri as any)))
+                }
+                window.addEventListener('message', listener)
+                return () => window.removeEventListener('message', listener)
+            },
+            setState: newState => vsCodeApi.setState(newState),
+            getState: () => vsCodeApi.getState(),
+        }
+    }
+    return genericApi
 }

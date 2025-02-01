@@ -1,71 +1,64 @@
-import { defaultAuthStatus, unauthenticatedStatus, type AuthStatus } from './protocol'
+import { type AuthStatus, type AuthenticatedAuthStatus, isDotCom } from '@sourcegraph/cody-shared'
+import type { AuthenticationError } from '@sourcegraph/cody-shared'
+import type { CurrentUserInfo } from '@sourcegraph/cody-shared/src/sourcegraph-api/graphql/client'
 
-/**
- * Checks a user's authentication status.
- * @param endpoint The server endpoint.
- * @param isDotComOrApp Whether the user is on an insider build instance or enterprise instance.
- * @param user Whether the user is logged in.
- * @param isEmailVerified Whether the user has verified their email. Default to true for non-enterprise instances.
- * @param isCodyEnabled Whether Cody is enabled on the Sourcegraph instance. Default to true for non-enterprise instances.
- * @param userCanUpgrade Whether the user can upgrade their plan.
- * @param version The Sourcegraph instance version.
- * @param avatarURL The user's avatar URL, or '' if not set.
- * @param username The user's username.
- * @param displayName The user's display name, or '' if not set.
- * @param primaryEmail The user's primary email, or '' if not set.
- * @returns The user's authentication status. It's for frontend to display when instance is on unsupported version if siteHasCodyEnabled is false
- */
-export function newAuthStatus(
-    endpoint: string,
-    isDotComOrApp: boolean,
-    user: boolean,
-    isEmailVerified: boolean,
-    isCodyEnabled: boolean,
-    userCanUpgrade: boolean,
-    version: string,
-    avatarURL: string,
-    username: string,
-    displayName?: string,
-    primaryEmail?: string,
-    configOverwrites?: AuthStatus['configOverwrites']
-): AuthStatus {
-    if (!user) {
-        return { ...unauthenticatedStatus, endpoint }
+type NewAuthStatusOptions = { endpoint: string } & (
+    | { authenticated: false; error?: AuthenticationError }
+    | (Pick<
+          AuthenticatedAuthStatus,
+          'authenticated' | 'username' | 'hasVerifiedEmail' | 'displayName' | 'avatarURL'
+      > & {
+          organizations?: CurrentUserInfo['organizations']
+          primaryEmail?:
+              | string
+              | {
+                    email: string
+                }
+              | null
+      })
+)
+
+export function newAuthStatus(options: NewAuthStatusOptions): AuthStatus {
+    if (!options.authenticated) {
+        return {
+            authenticated: false,
+            endpoint: options.endpoint,
+            error: { type: 'invalid-access-token' },
+            pendingValidation: false,
+        }
     }
-    const authStatus: AuthStatus = { ...defaultAuthStatus, endpoint }
-    // Set values and return early
-    authStatus.authenticated = user
-    authStatus.showInvalidAccessTokenError = !user
-    authStatus.requiresVerifiedEmail = isDotComOrApp
-    authStatus.hasVerifiedEmail = isDotComOrApp && isEmailVerified
-    authStatus.siteHasCodyEnabled = isCodyEnabled
-    authStatus.userCanUpgrade = userCanUpgrade
-    authStatus.siteVersion = version
-    authStatus.avatarURL = avatarURL
-    authStatus.primaryEmail = primaryEmail || ''
-    authStatus.displayName = displayName || ''
-    authStatus.username = username
-    if (configOverwrites) {
-        authStatus.configOverwrites = configOverwrites
+
+    const { endpoint, organizations } = options
+
+    const isDotCom_ = isDotCom(endpoint)
+    const primaryEmail =
+        typeof options.primaryEmail === 'string' ? options.primaryEmail : options.primaryEmail?.email
+    const requiresVerifiedEmail = isDotCom_
+    const hasVerifiedEmail = requiresVerifiedEmail && options.authenticated && options.hasVerifiedEmail
+    return {
+        ...options,
+        endpoint,
+        primaryEmail,
+        requiresVerifiedEmail,
+        hasVerifiedEmail,
+        pendingValidation: false,
+        isFireworksTracingEnabled:
+            isDotCom_ && !!organizations?.nodes.find(org => org.name === 'sourcegraph'),
+        organizations: organizations?.nodes,
     }
-    const isLoggedIn = authStatus.siteHasCodyEnabled && authStatus.authenticated
-    const isAllowed = authStatus.requiresVerifiedEmail ? authStatus.hasVerifiedEmail : true
-    authStatus.isLoggedIn = isLoggedIn && isAllowed
-    authStatus.isDotCom = isDotComOrApp
-    return authStatus
 }
 
 /**
  * Counts the number of lines and characters in code blocks in a given string.
  * @param text - The string to search for code blocks.
  * @returns An object with the total lineCount and charCount of code in code blocks,
- * or null if no code blocks are found.
+ * If no code blocks are found, all values are '0'
  */
-export const countGeneratedCode = (text: string): { lineCount: number; charCount: number } | null => {
+export const countGeneratedCode = (text: string): { lineCount: number; charCount: number } => {
     const codeBlockRegex = /```[\S\s]*?```/g
     const codeBlocks = text.match(codeBlockRegex)
     if (!codeBlocks) {
-        return null
+        return { charCount: 0, lineCount: 0 }
     }
     const count = { lineCount: 0, charCount: 0 }
     const backticks = '```'

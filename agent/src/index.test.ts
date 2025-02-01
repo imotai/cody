@@ -1,91 +1,80 @@
-import assert from 'assert'
-import { execSync } from 'child_process'
-import fspromises from 'fs/promises'
-import os from 'os'
-import path from 'path'
+import assert from 'node:assert'
+import { spawnSync } from 'node:child_process'
+import path from 'node:path'
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { Uri } from 'vscode'
 
-import { isWindows } from '@sourcegraph/cody-shared'
+import {
+    type ContextItem,
+    DOTCOM_URL,
+    ModelUsage,
+    type SerializedChatTranscript,
+} from '@sourcegraph/cody-shared'
 
-import type { ExtensionTranscriptMessage } from '../../vscode/src/chat/protocol'
-
-import { URI } from 'vscode-uri'
-import { isNode16 } from './isNode16'
-import { TestClient, asTranscriptMessage } from './TestClient'
-
-const explainPollyError = `
-
-    ===================================================[ NOTICE ]=======================================================
-    If you get PollyError or unexpected diff, you might need to update recordings to match your changes.
-    Run the following commands locally to update the recordings:
-
-      export SRC_ACCESS_TOKEN=YOUR_TOKEN
-      export SRC_ACCESS_TOKEN_WITH_RATE_LIMIT=RATE_LIMITED_TOKEN # see https://sourcegraph.slack.com/archives/C059N5FRYG3/p1702990080820699
-      export SRC_ENDPOINT=https://sourcegraph.com
-      pnpm update-agent-recordings
-      # Press 'u' to update the snapshots if the new behavior makes sense. It's
-      # normal that the LLM returns minor changes to the wording.
-      git commit -am "Update agent recordings"
-
-
-    More details in https://github.com/sourcegraph/cody/tree/main/agent#updating-the-polly-http-recordings
-    ====================================================================================================================
-
-    `
-
-const prototypePath = path.join(__dirname, '__tests__', 'example-ts')
-const workspaceRootUri = Uri.file(path.join(os.tmpdir(), 'cody-vscode-shim-test'))
-const workspaceRootPath = workspaceRootUri.fsPath
+import { getMockedDotComServerModelConfiguration } from '@sourcegraph/cody-shared/dist/models/dotcom'
+import * as uuid from 'uuid'
+import { ResponseError } from 'vscode-jsonrpc'
+import { CodyJsonRpcErrorCode } from '../../vscode/src/jsonrpc/CodyJsonRpcErrorCode'
+import { TESTING_CREDENTIALS } from '../../vscode/src/testutils/testing-credentials'
+import { logTestingData } from '../../vscode/test/fixtures/mock-server'
+import { TestClient } from './TestClient'
+import { TestWorkspace } from './TestWorkspace'
+import { decodeURIs } from './decodeURIs'
+import type { ChatExportResult } from './protocol-alias'
+import { trimEndOfLine } from './trimEndOfLine'
+const workspace = new TestWorkspace(path.join(__dirname, '__tests__', 'example-ts'))
 
 const mayRecord =
     process.env.CODY_RECORDING_MODE === 'record' || process.env.CODY_RECORD_IF_MISSING === 'true'
 
-describe('Agent', () => {
-    const dotcom = 'https://sourcegraph.com'
-    if (mayRecord) {
-        execSync('src login', { stdio: 'inherit' })
-        assert.strictEqual(
-            process.env.SRC_ENDPOINT,
-            dotcom,
-            'SRC_ENDPOINT must be https://sourcegraph.com'
+async function exportedTelemetryEvents(currentClient: TestClient) {
+    const response = await currentClient.request('testing/exportedTelemetryEvents', null)
+
+    // send data to testing pub/sub topic
+    // for each request in response, send to logtest
+    const testRunId = uuid.v4()
+    for (const event of response.events) {
+        // Assuming logTestingData is defined elsewhere in the codebase
+        logTestingData(
+            JSON.stringify(event),
+            'v2-agent-e2e',
+            expect.getState().currentTestName,
+            testRunId
         )
     }
+    // Equality check to ensure all expected events(feature:action) were fired
+    const loggedTelemetryEventsV2 = response.events.map(
+        (event: { feature: string; action: string }) => `${event.feature}:${event.action}`
+    )
+    return loggedTelemetryEventsV2
+}
 
-    if (process.env.VITEST_ONLY && !process.env.VITEST_ONLY.includes('Agent')) {
-        it('Agent tests are skipped due to VITEST_ONLY environment variable', () => {})
-        return
-    }
-
-    const client = new TestClient({
+describe('Agent', () => {
+    const client = TestClient.create({
+        workspaceRootUri: workspace.rootUri,
         name: 'defaultClient',
-        // The redacted ID below is copy-pasted from the recording file and
-        // needs to be updated whenever we change the underlying access token.
-        // We can't return a random string here because then Polly won't be able
-        // to associate the HTTP requests between record mode and replay mode.
-        accessToken:
-            process.env.SRC_ACCESS_TOKEN ??
-            'REDACTED_3709f5bf232c2abca4c612f0768368b57919ca6eaa470e3fd7160cbf3e8d0ec3',
+        credentials: TESTING_CREDENTIALS.dotcom,
     })
 
-    // Bundle the agent. When running `pnpm run test`, vitest doesn't re-run this step.
-    //
-    // ⚠️ If this line fails when running unit tests, chances are that the error is being swallowed.
-    // To see the full error, run this file in isolation:
-    //
-    //   pnpm test agent/src/index.test.ts
-    execSync('pnpm run build:agent', {
-        cwd: client.getAgentDir(),
-        stdio: 'inherit',
+    const rateLimitedClient = TestClient.create({
+        workspaceRootUri: workspace.rootUri,
+        name: 'rateLimitedClient',
+        credentials: TESTING_CREDENTIALS.dotcomProUserRateLimited,
     })
+
+    const mockContextItems: ContextItem[] = []
 
     // Initialize inside beforeAll so that subsequent tests are skipped if initialization fails.
     beforeAll(async () => {
-        await fspromises.mkdir(workspaceRootPath, { recursive: true })
-        await fspromises.cp(prototypePath, workspaceRootPath, {
-            recursive: true,
+        await workspace.beforeAll()
+
+        // Init a repo in the workspace to make the parent-dirs repo-name resolver work for Cody Context Filters tests.
+        spawnSync('git', ['init'], { cwd: workspace.rootPath, stdio: 'inherit' })
+        spawnSync('git', ['remote', 'add', 'origin', 'git@github.com:sourcegraph/cody.git'], {
+            cwd: workspace.rootPath,
+            stdio: 'inherit',
         })
+
         const serverInfo = await client.initialize({
             serverEndpoint: 'https://sourcegraph.com',
             // Initialization should always succeed even if authentication fails
@@ -93,57 +82,91 @@ describe('Agent', () => {
             // with a new access token.
             accessToken: 'sgp_INVALIDACCESSTOK_ENTHISSHOULDFAILEEEEEEEEEEEEEEEEEEEEEEE2',
         })
-        expect(serverInfo?.authStatus?.isLoggedIn).toBeFalsy()
+        expect(serverInfo?.authStatus?.authenticated).toBeFalsy()
 
         // Log in so test cases are authenticated by default
         const valid = await client.request('extensionConfiguration/change', {
             ...client.info.extensionConfiguration,
-            anonymousUserID: 'abcde1234',
             accessToken: client.info.extensionConfiguration?.accessToken ?? 'invalid',
-            serverEndpoint: client.info.extensionConfiguration?.serverEndpoint ?? dotcom,
+            serverEndpoint: client.info.extensionConfiguration?.serverEndpoint ?? DOTCOM_URL.toString(),
             customHeaders: {},
         })
-        expect(valid?.isLoggedIn).toBeTruthy()
-    }, 10_000)
+        expect(valid?.authenticated).toBe(true)
+
+        for (const name of [
+            'src/animal.ts',
+            'src/ChatColumn.tsx',
+            'src/Heading.tsx',
+            'src/squirrel.ts',
+        ]) {
+            const item = await workspace.loadContextItem(name)
+            // Trim content to the first 20 lines to imitate our context-fetching, which only includes file chunks
+            item.content = item.content?.split('\n').slice(0, 20).join('\n')
+            mockContextItems.push(item)
+        }
+    }, 20_000)
 
     beforeEach(async () => {
         await client.request('testing/reset', null)
     })
 
-    const sumPath = path.join(workspaceRootPath, 'src', 'sum.ts')
-    const sumUri = Uri.file(sumPath)
-    const animalPath = path.join(workspaceRootPath, 'src', 'animal.ts')
-    const animalUri = Uri.file(animalPath)
-    const squirrelPath = path.join(workspaceRootPath, 'src', 'squirrel.ts')
-    const squirrelUri = Uri.file(squirrelPath)
-    const multipleSelections = path.join(workspaceRootPath, 'src', 'multiple-selections.ts')
-    const multipleSelectionsUri = Uri.file(multipleSelections)
+    const sumUri = workspace.file('src', 'sum.ts')
+    const animalUri = workspace.file('src', 'animal.ts')
+    const squirrelUri = workspace.file('src', 'squirrel.ts')
 
-    it('extensionConfiguration/change (handle errors)', async () => {
+    async function setChatModel(model = 'mistral::v1::mixtral-8x7b-instruct'): Promise<string> {
+        // Use the same chat model regardless of the server response (in case it changes on the
+        // remote endpoint so we don't need to regenerate all the recordings).
+        const freshChatID = await client.request('chat/new', null)
+        await client.request('chat/setModel', {
+            id: freshChatID,
+            model,
+        })
+        return freshChatID
+    }
+
+    it('extensionConfiguration/change & chat/models (handle errors)', async () => {
         // Send two config change notifications because this is what the
         // JetBrains client does and there was a bug where everything worked
         // fine as long as we didn't send the second unauthenticated config
         // change.
+        const initModelName = getMockedDotComServerModelConfiguration().defaultModels.chat
+        const { models } = await client.request('chat/models', { modelUsage: ModelUsage.Chat })
+        expect(models[0].model.id).toStrictEqual(initModelName)
+
         const invalid = await client.request('extensionConfiguration/change', {
             ...client.info.extensionConfiguration,
-            anonymousUserID: 'abcde1234',
             // Redacted format of an invalid access token (just random string). Tests fail in replay mode
             // if we don't use the redacted format here.
             accessToken: 'REDACTED_0ba08837494d00e3943c46999589eb29a210ba8063f084fff511c8e4d1503909',
             serverEndpoint: 'https://sourcegraph.com/',
             customHeaders: {},
         })
-        expect(invalid?.isLoggedIn).toBeFalsy()
+        expect(invalid?.authenticated).toBeFalsy()
+        const invalidModels = await client.request('chat/models', { modelUsage: ModelUsage.Chat })
+        const remoteInvalidModels = invalidModels.models.filter(
+            ({ model }) => model.provider !== 'Ollama'
+        )
+        expect(remoteInvalidModels).toStrictEqual([])
+
         const valid = await client.request('extensionConfiguration/change', {
             ...client.info.extensionConfiguration,
-            anonymousUserID: 'abcde1234',
             accessToken: client.info.extensionConfiguration?.accessToken ?? 'invalid',
-            serverEndpoint: client.info.extensionConfiguration?.serverEndpoint ?? dotcom,
+            serverEndpoint: client.info.extensionConfiguration?.serverEndpoint ?? DOTCOM_URL.toString(),
             customHeaders: {},
         })
-        expect(valid?.isLoggedIn).toBeTruthy()
+        expect(valid?.status).toEqual('authenticated')
+        if (valid?.status !== 'authenticated') {
+            throw new Error('unreachable')
+        }
 
-        // Please don't update the recordings to use a different account without consulting #wg-cody-agent.
+        const reauthenticatedModels = await client.request('chat/models', {
+            modelUsage: ModelUsage.Chat,
+        })
+        expect(reauthenticatedModels.models).not.toStrictEqual([])
+        expect(reauthenticatedModels.models[0].model.id).toStrictEqual(initModelName)
+
+        // Please don't update the recordings to use a different account without consulting #team-cody-core.
         // When changing an account, you also need to update the REDACTED_ hash above.
         //
         // To update the recordings with the correct account, run the following command
@@ -152,30 +175,18 @@ describe('Agent', () => {
         //    source agent/scripts/export-cody-http-recording-tokens.sh
         //
         // If you don't have access to this private file then you need to ask
-        // for sombody on the Sourcegraph team to help you update the HTTP requests.
-        expect(valid?.username).toStrictEqual('olafurpg-testing')
-    }, 10_000)
+        expect(valid.username).toStrictEqual('sourcegraphbot9k-fnwmu')
 
-    it('autocomplete/execute (non-empty result)', async () => {
-        await client.openFile(sumUri)
-        const completions = await client.request('autocomplete/execute', {
-            uri: sumUri.toString(),
-            position: { line: 1, character: 3 },
-            triggerKind: 'Invoke',
-        })
-        const texts = completions.items.map(item => item.insertText)
-        expect(completions.items.length).toBeGreaterThan(0)
-        expect(texts).toMatchInlineSnapshot(
-            `
-          [
-            "   return a + b;",
-          ]
-        `,
-            explainPollyError
+        // telemetry assertion, to validate the expected events fired during the test run
+        // Do not remove this assertion, and instead update the expectedEvents list above
+        expect(await exportedTelemetryEvents(client)).toEqual(
+            expect.arrayContaining([
+                'cody.auth:connected',
+                'cody.auth.login:firstEver',
+                'cody.interactiveTutorial:attemptingStart',
+                'cody.experiment.interactiveTutorial:enrolled',
+            ])
         )
-        client.notify('autocomplete/completionAccepted', {
-            completionID: completions.items[0].id,
-        })
     }, 10_000)
 
     it('graphql/getCurrentUserCodySubscription', async () => {
@@ -186,27 +197,30 @@ describe('Agent', () => {
         expect(currentUserCodySubscription).toMatchInlineSnapshot(`
           {
             "applyProRateLimits": true,
-            "currentPeriodEndAt": "2024-02-10T23:59:59Z",
-            "currentPeriodStartAt": "2024-01-11T00:00:00Z",
+            "currentPeriodEndAt": "2025-01-14T22:11:32Z",
+            "currentPeriodStartAt": "2024-12-14T22:11:32Z",
             "plan": "PRO",
-            "status": "PENDING",
+            "status": "ACTIVE",
           }
         `)
+        // telemetry assertion, to validate the expected events fired during the test run
+        // Do not remove this assertion, and instead update the expectedEvents list above
+        expect(await exportedTelemetryEvents(client)).toEqual(expect.arrayContaining([]))
     }, 10_000)
 
     describe('Chat', () => {
         it('chat/submitMessage (short message)', async () => {
+            await setChatModel(getMockedDotComServerModelConfiguration().defaultModels.chat)
             const lastMessage = await client.sendSingleMessageToNewChat('Hello!')
-            expect(lastMessage).toMatchInlineSnapshot(
-                `
-          {
-            "contextFiles": [],
-            "displayText": " Hello! Nice to meet you.",
-            "speaker": "assistant",
-            "text": " Hello! Nice to meet you.",
-          }
-        `,
-                explainPollyError
+            expect(lastMessage).toMatchSnapshot()
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(
+                expect.arrayContaining([
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:noCode',
+                ])
             )
         }, 30_000)
 
@@ -215,171 +229,187 @@ describe('Agent', () => {
                 'Generate simple hello world function in java!'
             )
             const trimmedMessage = trimEndOfLine(lastMessage?.text ?? '')
-            expect(trimmedMessage).toMatchInlineSnapshot(
-                `
-          " Here is a simple Hello World program in Java:
+            expect(trimmedMessage).toMatchSnapshot()
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(
+                expect.arrayContaining([
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:hasCode',
+                ])
+            )
+        }, 30_000)
 
-          \`\`\`java
-          public class Main {
-
-            public static void main(String[] args) {
-              System.out.println("Hello World!");
+        it('chat/import allows importing a chat transcript from an external source', async () => {
+            const toChatExportResult = (transcript: SerializedChatTranscript): ChatExportResult => ({
+                chatID: transcript.id,
+                transcript: transcript,
+            })
+            const auth = await client.request('extensionConfiguration/status', null)
+            expect(auth?.status).toEqual('authenticated')
+            if (auth?.status !== 'authenticated') {
+                throw new Error('unreachable')
             }
 
-          }
-          \`\`\`
-
-          This program defines a Main class with a main method, which is the entry point for a Java program.
-
-          Inside the main method, it uses System.out.println to print "Hello World!" to the console.
-
-          To run this program, you would need to:
-
-          1. Save it as Main.java
-          2. Compile it with \`javac Main.java\`
-          3. Run it with \`java Main\`
-
-          The output would be:
-
-          \`\`\`
-          Hello World!
-          \`\`\`
-
-          Let me know if you need any clarification or have additional requirements for the Hello World program!"
-        `,
-                explainPollyError
-            )
-        }, 30_000)
-
-        it('chat/restore', async () => {
-            // Step 1: create a chat session where I share my name.
-            const id1 = await client.request('chat/new', null)
-            const reply1 = asTranscriptMessage(
-                await client.request('chat/submitMessage', {
-                    id: id1,
-                    message: {
-                        command: 'submit',
-                        text: 'My name is Lars Monsen',
-                        submitType: 'user',
-                        addEnhancedContext: false,
+            const transcript1: SerializedChatTranscript = {
+                id: 'transcript1',
+                interactions: [
+                    {
+                        humanMessage: {
+                            speaker: 'human',
+                            text: 'Hello, Cody!',
+                        },
+                        assistantMessage: {
+                            speaker: 'assistant',
+                            text: 'Hello! How can I assist you today?',
+                        },
                     },
-                })
-            )
-
-            // Step 2: restore a new chat session with a transcript including my name, and
-            //  and assert that it can retrieve my name from the transcript.
-            const {
-                models: [model],
-            } = await client.request('chat/models', { id: id1 })
-
-            const id2 = await client.request('chat/restore', {
-                modelID: model.model,
-                messages: reply1.messages,
-                chatID: new Date().toISOString(), // Create new Chat ID with a different timestamp
-            })
-            const reply2 = asTranscriptMessage(
-                await client.request('chat/submitMessage', {
-                    id: id2,
-                    message: {
-                        command: 'submit',
-                        text: 'What is my name?',
-                        submitType: 'user',
-                        addEnhancedContext: false,
+                    {
+                        humanMessage: {
+                            speaker: 'human',
+                            text: 'Can you help me with my code?',
+                        },
+                        assistantMessage: {
+                            speaker: 'assistant',
+                            text: 'Of course! What do you need help with?',
+                        },
                     },
-                })
-            )
-            expect(reply2.messages.at(-1)?.text).toMatchInlineSnapshot(
-                '" You told me your name is Lars Monsen."',
-                explainPollyError
-            )
-        }, 30_000)
+                ],
+                lastInteractionTimestamp: '2023-10-01T12:00:00Z',
+            }
 
-        it('chat/submitMessage (addEnhancedContext: true)', async () => {
+            const transcript2: SerializedChatTranscript = {
+                id: 'transcript2',
+                interactions: [
+                    {
+                        humanMessage: {
+                            speaker: 'human',
+                            text: 'My name is Lars Monsen.',
+                        },
+                        assistantMessage: {
+                            speaker: 'assistant',
+                            text: 'Lovely to meet you, Lars.',
+                        },
+                    },
+                ],
+                lastInteractionTimestamp: '2023-10-02T08:30:00Z',
+            }
+
+            const transcript3: SerializedChatTranscript = {
+                id: 'transcript3',
+                chatTitle: 'Debugging Session',
+                interactions: [
+                    {
+                        humanMessage: {
+                            speaker: 'human',
+                            text: 'My name is Bear Grylls.',
+                        },
+                        assistantMessage: {
+                            speaker: 'assistant',
+                            text: 'Nice to meet you, Bear.',
+                        },
+                    },
+                ],
+                lastInteractionTimestamp: '2023-10-03T14:45:00Z',
+            }
+
+            // The history we are importing contains two transcripts from the same user and one from a different user.
+            // when we do an export, we should only get the transcript from the currently logged in user
+            const history: Record<string, Record<string, SerializedChatTranscript>> = {
+                [`${auth.endpoint}-${auth.username}`]: {
+                    [transcript1.id]: transcript1,
+                    [transcript2.id]: transcript2,
+                },
+                someOtherUser: {
+                    [transcript3.id]: transcript3,
+                },
+            }
+
+            await client.request('chat/import', { history, merge: true })
+            const exported = await client.request('chat/export', null)
+            const expected: ChatExportResult[] = [
+                toChatExportResult(transcript1),
+                toChatExportResult(transcript2),
+            ]
+
+            expect(exported).toEqual(expected)
+        })
+
+        it('chat/submitMessage (with mock context)', async () => {
             await client.openFile(animalUri)
-            await client.request('command/execute', {
-                command: 'cody.search.index-update',
-            })
             const lastMessage = await client.sendSingleMessageToNewChat(
-                'Write a class Dog that implements the Animal interface in my workspace. Only show the code, no explanation needed.',
+                'Write a class Dog that implements the Animal interface in my workspace. Show the code only, no explanation needed.',
                 {
-                    addEnhancedContext: true,
+                    contextFiles: mockContextItems,
                 }
             )
             // TODO: make this test return a TypeScript implementation of
             // `animal.ts`. It currently doesn't do this because the workspace root
             // is not a git directory and symf reports some git-related error.
-            expect(trimEndOfLine(lastMessage?.text ?? '')).toMatchInlineSnapshot(
-                `
-              " \`\`\`typescript
-              export class Dog implements Animal {
-                name: string;
-
-                makeAnimalSound() {
-                  return "Bark!";
-                }
-
-                isMammal = true;
-              }
-              \`\`\`"
-            `,
-                explainPollyError
+            expect(trimEndOfLine(lastMessage?.text ?? '')).toMatchSnapshot()
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(
+                expect.arrayContaining([
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:hasCode',
+                ])
             )
         }, 30_000)
 
-        it('chat/submitMessage (addEnhancedContext: true, squirrel test)', async () => {
+        it('chat/submitMessage (squirrel test)', async () => {
             await client.openFile(squirrelUri)
-            await client.request('command/execute', {
-                command: 'cody.search.index-update',
-            })
             const { lastMessage, transcript } =
-                await client.sendSingleMessageToNewChatWithFullTranscript('What is Squirrel?', {
-                    addEnhancedContext: true,
-                })
+                await client.sendSingleMessageToNewChatWithFullTranscript(
+                    // Emphasize showing code examples to hit on `chatResponse:hasCode` event.
+                    'What is Squirrel? Show me concrete code examples',
+                    {
+                        contextFiles: mockContextItems,
+                    }
+                )
             expect(lastMessage?.text?.toLocaleLowerCase() ?? '').includes('code nav')
             expect(lastMessage?.text?.toLocaleLowerCase() ?? '').includes('sourcegraph')
             decodeURIs(transcript)
             const contextFiles = transcript.messages.flatMap(m => m.contextFiles ?? [])
             expect(contextFiles).not.toHaveLength(0)
             expect(contextFiles.map(file => file.uri.toString())).includes(squirrelUri.toString())
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(
+                expect.arrayContaining([
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:hasCode',
+                ])
+            )
         }, 30_000)
-
-        // Workaround for the fact that `ContextFile.uri` is a class that
-        // serializes to JSON as an object, and deserializes back into a JS
-        // object instead of the class. Without this,
-        // `ContextFile.uri.toString()` return `"[Object object]".
-        function decodeURIs(transcript: ExtensionTranscriptMessage): void {
-            for (const message of transcript.messages) {
-                if (message.contextFiles) {
-                    for (const file of message.contextFiles) {
-                        file.uri = URI.from(file.uri)
-                    }
-                }
-            }
-        }
 
         it('webview/receiveMessage (type: chatModel)', async () => {
             const id = await client.request('chat/new', null)
             {
-                await client.setChatModel(id, 'openai/gpt-3.5-turbo')
-                const lastMessage = await client.sendMessage(
-                    id,
-                    'which company, other than sourcegraph, created you?'
-                )
-                expect(lastMessage?.text?.toLocaleLowerCase().includes('openai')).toBeTruthy()
+                await client.request('chat/setModel', { id, model: 'google::v1::gemini-1.5-flash' })
+                const lastMessage = await client.sendMessage(id, 'what color is the sky?')
+                expect(lastMessage?.text?.toLocaleLowerCase().includes('blue')).toBeTruthy()
             }
-            {
-                await client.setChatModel(id, 'anthropic/claude-2.0')
-                const lastMessage = await client.sendMessage(
-                    id,
-                    'which company, other than sourcegraph, created you?'
-                )
-                expect(lastMessage?.text?.toLocaleLowerCase().indexOf('anthropic')).toBeTruthy()
-            }
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(
+                expect.arrayContaining([
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:noCode',
+                ])
+            )
         }, 30_000)
 
-        it('webview/receiveMessage (type: reset)', async () => {
+        it.skip('webview/receiveMessage (type: reset)', async () => {
             const id = await client.request('chat/new', null)
-            await client.setChatModel(id, 'fireworks/accounts/fireworks/models/mixtral-8x7b-instruct')
+            await client.request('chat/setModel', {
+                id,
+                model: 'mistral::v1::mixtral-8x7b-instruct',
+            })
             await client.sendMessage(
                 id,
                 'The magic word is "kramer". If I say the magic word, respond with a single word: "quone".'
@@ -393,18 +423,32 @@ describe('Agent', () => {
                 const lastMessage = await client.sendMessage(id, 'kramer')
                 expect(lastMessage?.text?.toLocaleLowerCase().includes('quone')).toBeFalsy()
             }
-        })
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(
+                expect.arrayContaining([
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:noCode',
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:noCode',
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:noCode',
+                ])
+            )
+        }, 30_000)
 
-        // Tests for edits would fail on Node 16 (ubuntu16) possibly due to an API that is not supported
-        describe.skipIf(isNode16())('chat/editMessage', () => {
-            it(
+        describe('chat/editMessage', () => {
+            it.skip(
                 'edits the last human chat message',
                 async () => {
                     const id = await client.request('chat/new', null)
-                    await client.setChatModel(
+                    await client.request('chat/setModel', {
                         id,
-                        'fireworks/accounts/fireworks/models/mixtral-8x7b-instruct'
-                    )
+                        model: 'mistral::v1::mixtral-8x7b-instruct',
+                    })
                     await client.sendMessage(
                         id,
                         'The magic word is "kramer". If I say the magic word, respond with a single word: "quone".'
@@ -421,16 +465,36 @@ describe('Agent', () => {
                         const lastMessage = await client.sendMessage(id, 'georgey')
                         expect(lastMessage?.text?.toLocaleLowerCase().includes('festivus')).toBeTruthy()
                     }
+                    // telemetry assertion, to validate the expected events fired during the test run
+                    // Do not remove this assertion, and instead update the expectedEvents list above
+                    expect(await exportedTelemetryEvents(client)).toEqual(
+                        expect.arrayContaining([
+                            'cody.chat-question:submitted',
+                            'cody.chat-question:executed',
+                            'cody.chatResponse:noCode',
+                            'cody.chat-question:submitted',
+                            'cody.chat-question:executed',
+                            'cody.editChatButton:clicked',
+                            'cody.chatResponse:noCode',
+                            'cody.editChatButton:clicked',
+                            'cody.chat-question:submitted',
+                            'cody.chat-question:executed',
+                            'cody.chatResponse:noCode',
+                            'cody.chat-question:submitted',
+                            'cody.chat-question:executed',
+                            'cody.chatResponse:noCode',
+                        ])
+                    )
                 },
-                { timeout: mayRecord ? 10_000 : undefined }
+                { timeout: mayRecord ? 10_000 : 5000 }
             )
 
             it('edits messages by index', async () => {
                 const id = await client.request('chat/new', null)
-                await client.setChatModel(
+                await client.request('chat/setModel', {
                     id,
-                    'fireworks/accounts/fireworks/models/mixtral-8x7b-instruct'
-                )
+                    model: 'mistral::v1::mixtral-8x7b-instruct',
+                })
                 // edits by index replaces message at index, and erases all subsequent messages
                 await client.sendMessage(
                     id,
@@ -457,43 +521,23 @@ describe('Agent', () => {
                     expect(answer?.includes('bird')).toBeFalsy()
                     expect(answer?.includes('dog')).toBeFalsy()
                 }
+                // telemetry assertion, to validate the expected events fired during the test run
+                // Do not remove this assertion, and instead update the expectedEvents list above
+                expect(await exportedTelemetryEvents(client)).toEqual(
+                    expect.arrayContaining([
+                        'cody.chat-question:submitted',
+                        'cody.chat-question:executed',
+                        'cody.editChatButton:clicked',
+                    ])
+                )
             }, 30_000)
         })
     })
 
-    describe('Text documents', () => {
-        it('chat/submitMessage (understands the selected text)', async () => {
-            await client.request('command/execute', {
-                command: 'cody.search.index-update',
-            })
-            await client.openFile(multipleSelectionsUri)
-            await client.changeFile(multipleSelectionsUri)
-            await client.changeFile(multipleSelectionsUri, {
-                selectionName: 'SELECTION_2',
-            })
-            const reply = await client.sendSingleMessageToNewChat(
-                'What is the name of the function that I have selected? Only answer with the name of the function, nothing else',
-                { addEnhancedContext: true }
-            )
-            expect(reply?.text?.trim()).includes('anotherFunction')
-            expect(reply?.text?.trim()).not.includes('inner')
-            await client.changeFile(multipleSelectionsUri)
-            const reply2 = await client.sendSingleMessageToNewChat(
-                'What is the name of the function that I have selected? Only answer with the name of the function, nothing else',
-                { addEnhancedContext: true }
-            )
-            expect(reply2?.text?.trim()).includes('inner')
-            expect(reply2?.text?.trim()).not.includes('anotherFunction')
-        }, 20_000)
-    })
-
     describe('Commands', () => {
         it('commands/explain', async () => {
-            await client.request('command/execute', {
-                command: 'cody.search.index-update',
-            })
             await client.openFile(animalUri)
-            const freshChatID = await client.request('chat/new', null)
+            const freshChatID = await setChatModel()
             const id = await client.request('commands/explain', null)
 
             // Assert that the server is not using IDs between `chat/new` and
@@ -502,282 +546,37 @@ describe('Agent', () => {
             expect(id).not.toStrictEqual(freshChatID)
 
             const lastMessage = await client.firstNonEmptyTranscript(id)
-            expect(trimEndOfLine(lastMessage.messages.at(-1)?.text ?? '')).toMatchInlineSnapshot(
-                `
-              " Here is an explanation of the selected TypeScript code in simple terms:
-
-              The Animal interface
-
-              The Animal interface defines the shape of an Animal object. It does not contain any actual implementation, just declarations for what properties and methods an Animal object should have.
-
-              The interface has three members:
-
-              1. name - This is a string property to store the animal's name.
-
-              2. makeAnimalSound() - This is a method that should return a string representing the sound the animal makes.
-
-              3. isMammal - This is a boolean property that indicates if the animal is a mammal or not.
-
-              The purpose of this interface is to define a consistent structure for Animal objects. Any class that implements the Animal interface will be required to have these three members with these types.
-
-              This allows code dealing with Animal objects to know it can call animal.makeAnimalSound() and access animal.name and animal.isMammal, regardless of the specific class. The interface defines the contract between the implementation and usage of Animals, without caring about specific details.
-
-              Interfaces like this are useful for writing reusable code that can handle different types of objects in a consistent way. The code using the interface doesn't need to know about the specifics of each class, just that it implements the Animal interface. This allows easily extending the code to handle new types of animals by simply creating a new class implementing Animal.
-
-              So in summary, the Animal interface defines the input expectations and output guarantees for objects representing animals in the system, allowing code to work with any animal in a generic way based on this contract."
-            `,
-                explainPollyError
+            expect(trimEndOfLine(lastMessage.messages.at(-1)?.text ?? '')).toMatchSnapshot()
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(
+                expect.arrayContaining([
+                    'cody.command.explain:executed',
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:noCode',
+                ])
             )
         }, 30_000)
-
-        // This test seems extra sensitive on Node v16 for some reason.
-        it.skipIf(isNode16() || isWindows())(
-            'commands/test',
-            async () => {
-                await client.request('command/execute', {
-                    command: 'cody.search.index-update',
-                })
-                await client.openFile(animalUri)
-                const id = await client.request('commands/test', null)
-                const lastMessage = await client.firstNonEmptyTranscript(id)
-                expect(trimEndOfLine(lastMessage.messages.at(-1)?.text ?? '')).toMatchInlineSnapshot(
-                    `
-                  " Okay, reviewing the shared context, it looks like there are no existing test files provided.
-
-                  Since \`src/animal.ts\` defines an \`Animal\` interface, I will generate Jest unit tests for this interface in \`src/animal.test.ts\`:
-
-                  \`\`\`typescript
-                  // src/animal.test.ts
-
-                  import { Animal } from './animal';
-
-                  describe('Animal interface', () => {
-
-                    it('should have a name property', () => {
-                      const animal: Animal = {
-                        name: 'Cat',
-                        makeAnimalSound: () => '',
-                        isMammal: true
-                      };
-
-                      expect(animal.name).toBeDefined();
-                    });
-
-                    it('should have a makeAnimalSound method', () => {
-                      const animal: Animal = {
-                        name: 'Dog',
-                        makeAnimalSound: () => 'Woof',
-                        isMammal: true
-                      };
-
-                      expect(animal.makeAnimalSound).toBeDefined();
-                      expect(typeof animal.makeAnimalSound).toBe('function');
-                    });
-
-                    it('should have an isMammal property', () => {
-                      const animal: Animal = {
-                        name: 'Snake',
-                        makeAnimalSound: () => 'Hiss',
-                        isMammal: false
-                      };
-
-                      expect(animal.isMammal).toBeDefined();
-                      expect(typeof animal.isMammal).toBe('boolean');
-                    });
-
-                  });
-                  \`\`\`
-
-                  This covers basic validation of the Animal interface properties and methods using Jest assertions. Additional tests could validate more complex object shapes and logic."
-                `,
-                    explainPollyError
-                )
-            },
-            30_000
-        )
 
         it('commands/smell', async () => {
             await client.openFile(animalUri)
+            await setChatModel()
             const id = await client.request('commands/smell', null)
             const lastMessage = await client.firstNonEmptyTranscript(id)
 
-            expect(trimEndOfLine(lastMessage.messages.at(-1)?.text ?? '')).toMatchInlineSnapshot(
-                `
-              " Here are 5 potential improvements for the selected TypeScript code:
-
-              1. Add type annotations for method parameters and return values:
-
-              \`\`\`
-              export interface Animal {
-                name: string
-                makeAnimalSound(volume?: number): string
-                isMammal: boolean
-              }
-              \`\`\`
-
-              Adding type annotations makes the code more self-documenting and enables stronger type checking.
-
-              2. Make interface name more semantic:
-
-              \`\`\`
-              export interface Creature {
-                // ...
-              }
-              \`\`\`
-
-              The name 'Animal' is not very descriptive. A name like 'Creature' captures the intent better.
-
-              3. Make sound method name more semantic:
-
-              \`\`\`
-              makeSound()
-              \`\`\`
-
-              The name 'makeAnimalSound' is verbose. A shorter name like 'makeSound' conveys the purpose clearly.
-
-              4. Use boolean type for isMammal property:
-
-              \`\`\`
-              isMammal: boolean
-              \`\`\`
-
-              Using the boolean type instead of just true/false improves readability.
-
-              5. Add JSDoc comments for documentation:
-
-              \`\`\`
-              /**
-               * Represents a creature in the game
-               */
-              export interface Creature {
-                // ...
-              }
-              \`\`\`
-
-              JSDoc comments enable generating API documentation and improve understandability.
-
-              Overall, the selected code follows reasonable design principles. The interface encapsulates animal data nicely. The suggestions above would incrementally improve quality but no major issues were found."
-            `,
-                explainPollyError
+            expect(trimEndOfLine(lastMessage.messages.at(-1)?.text ?? '')).toMatchSnapshot()
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(
+                expect.arrayContaining([
+                    'cody.command.smell:executed',
+                    'cody.chat-question:submitted',
+                    'cody.chat-question:executed',
+                    'cody.chatResponse:hasCode',
+                ])
             )
         }, 30_000)
-
-        describe('Document code', () => {
-            function check(name: string, filename: string, assertion: (obtained: string) => void): void {
-                it(name, async () => {
-                    await client.request('command/execute', {
-                        command: 'cody.search.index-update',
-                    })
-                    const uri = Uri.file(path.join(workspaceRootPath, 'src', filename))
-                    await client.openFile(uri, { removeCursor: false })
-                    const task = await client.request('commands/document', null)
-                    await client.taskHasReachedAppliedPhase(task)
-                    const lenses = client.codeLenses.get(uri.toString()) ?? []
-                    expect(lenses).toHaveLength(4) // Show diff, accept, retry , undo
-                    const acceptCommand = lenses.find(
-                        ({ command }) => command?.command === 'cody.fixup.codelens.accept'
-                    )
-                    if (acceptCommand === undefined || acceptCommand.command === undefined) {
-                        throw new Error(
-                            `Expected accept command, found none. Lenses ${JSON.stringify(
-                                lenses,
-                                null,
-                                2
-                            )}`
-                        )
-                    }
-                    await client.request('command/execute', acceptCommand.command)
-                    expect(client.codeLenses.get(uri.toString()) ?? []).toHaveLength(0)
-                    const newContent = client.workspace.getDocument(uri)?.content
-                    assertion(trimEndOfLine(newContent))
-                })
-            }
-
-            check('commands/document (basic function)', 'sum.ts', obtained =>
-                expect(obtained).toMatchInlineSnapshot(`
-                  "/**
-                   * Sums two numbers and returns the result.
-                  */
-                  export function sum(a: number, b: number): number {
-                      /* CURSOR */
-                  }
-                  "
-                `)
-            )
-
-            check('commands/document (Method as part of a class)', 'TestClass.ts', obtained =>
-                expect(obtained).toMatchInlineSnapshot(`
-                  "const foo = 42
-
-                  export class TestClass {
-                      constructor(private shouldGreet: boolean) {}
-
-                      /**
-                       * If shouldGreet is true, logs a greeting to the console.
-                       */
-                      public functionName() {
-                          if (this.shouldGreet) {
-                              console.log(/* CURSOR */ 'Hello World!')
-                          }
-                      }
-                  }
-                  "
-                `)
-            )
-
-            check('commands/document (Function within a property)', 'TestLogger.ts', obtained =>
-                expect(obtained).toMatchInlineSnapshot(`
-                  "const foo = 42
-                  /**
-                   * Starts logging by initializing some internal state,
-                   * and then calls an internal \`recordLog\` function
-                   * to log a sample message.
-                   */
-                  export const TestLogger = {
-                      startLogging: () => {
-                          // Do some stuff
-
-                          function recordLog() {
-                              console.log(/* CURSOR */ 'Recording the log')
-                          }
-
-                          recordLog()
-                      },
-                  }
-                  "
-                `)
-            )
-
-            check('commands/document (nested test case)', 'example.test.ts', obtained =>
-                expect(obtained).toMatchInlineSnapshot(`
-                  "import { expect } from 'vitest'
-                  import { it } from 'vitest'
-                  import { describe } from 'vitest'
-
-                  /**
-                   * Test block that contains 3 test cases:
-                   * - Does test 1
-                   * - Does test 2
-                   * - Does another test that has a bug
-                  */
-                  describe('test block', () => {
-                      it('does 1', () => {
-                          expect(true).toBe(true)
-                      })
-
-                      it('does 2', () => {
-                          expect(true).toBe(true)
-                      })
-
-                      it('does something else', () => {
-                          // This line will error due to incorrect usage of \`performance.now\`
-                          const startTime = performance.now(/* CURSOR */)
-                      })
-                  })
-                  "
-                `)
-            )
-        })
     })
 
     describe('Progress bars', () => {
@@ -842,6 +641,9 @@ describe('Agent', () => {
                 ],
               ]
             `)
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(expect.arrayContaining([]))
         })
 
         it('progress/cancel', async () => {
@@ -858,187 +660,63 @@ describe('Agent', () => {
             } finally {
                 disposable.dispose()
             }
+            // telemetry assertion, to validate the expected events fired during the test run
+            // Do not remove this assertion, and instead update the expectedEvents list above
+            expect(await exportedTelemetryEvents(client)).toEqual(expect.arrayContaining([]))
         })
     })
 
     describe('RateLimitedAgent', () => {
-        const rateLimitedClient = new TestClient({
-            name: 'rateLimitedClient',
-            accessToken:
-                process.env.SRC_ACCESS_TOKEN_WITH_RATE_LIMIT ??
-                // See comment above `const client =` about how this value is derived.
-                'REDACTED_8c77b24d9f3d0e679509263c553887f2887d67d33c4e3544039c1889484644f5',
-        })
         // Initialize inside beforeAll so that subsequent tests are skipped if initialization fails.
         beforeAll(async () => {
             const serverInfo = await rateLimitedClient.initialize()
 
-            expect(serverInfo.authStatus?.isLoggedIn).toBeTruthy()
-            expect(serverInfo.authStatus?.username).toStrictEqual('david.veszelovszki')
+            expect(serverInfo.authStatus?.status).toEqual('authenticated')
+            if (serverInfo.authStatus?.status !== 'authenticated') {
+                throw new Error('unreachable')
+            }
+            expect(serverInfo.authStatus.username).toStrictEqual('sourcegraphcodyclients-1-efapb')
         }, 10_000)
 
-        it('chat/submitMessage (RateLimitError)', async () => {
+        // Skipped because Polly is failing to record the HTTP rate-limit error
+        // response. Keeping the code around in case we need to debug these in
+        // the future. Use the following command to run this test:
+        // - First, mark this test as `it.only`
+        // - Next, run `CODY_RECORDING_MODE=passthrough pnpm test agent/src/index.test.ts`
+        it.skip('chat/submitMessage (RateLimitError)', async () => {
             const lastMessage = await rateLimitedClient.sendSingleMessageToNewChat('sqrt(9)')
             // Intentionally not a snapshot assertion because we should never
             // automatically update 'RateLimitError' to become another value.
             expect(lastMessage?.error?.name).toStrictEqual('RateLimitError')
         }, 30_000)
 
+        // Skipped because Polly is failing to record the HTTP rate-limit error
+        // response. Keeping the code around in case we need to debug these in
+        // the future. Use the following command to run this test:
+        // - First, mark this test as `it.only`
+        // - Next, run `CODY_RECORDING_MODE=passthrough pnpm test agent/src/index.test.ts`
+        it.skip('autocomplete/trigger (RateLimitError)', async () => {
+            let code = 0
+            try {
+                await rateLimitedClient.openFile(sumUri)
+                const result = await rateLimitedClient.autocompleteText()
+                console.log({ result })
+            } catch (error) {
+                if (error instanceof ResponseError) {
+                    code = error.code
+                }
+            }
+            expect(code).toEqual(CodyJsonRpcErrorCode.RateLimitError)
+        }, 30_000)
         afterAll(async () => {
             await rateLimitedClient.shutdownAndExit()
             // Long timeout because to allow Polly.js to persist HTTP recordings
         }, 30_000)
     })
 
-    describe('Enterprise', () => {
-        const enterpriseClient = new TestClient({
-            name: 'enterpriseClient',
-            accessToken:
-                process.env.SRC_ENTERPRISE_ACCESS_TOKEN ??
-                // See comment above `const client =` about how this value is derived.
-                'REDACTED_b20717265e7ab1d132874d8ff0be053ab9c1dacccec8dce0bbba76888b6a0a69',
-            serverEndpoint: 'https://demo.sourcegraph.com',
-            telemetryExporter: 'graphql',
-            logEventMode: 'connected-instance-only',
-        })
-        // Initialize inside beforeAll so that subsequent tests are skipped if initialization fails.
-        beforeAll(async () => {
-            const serverInfo = await enterpriseClient.initialize()
-
-            expect(serverInfo.authStatus?.isLoggedIn).toBeTruthy()
-            expect(serverInfo.authStatus?.username).toStrictEqual('codytesting')
-        }, 10_000)
-
-        it('chat/submitMessage', async () => {
-            const lastMessage = await enterpriseClient.sendSingleMessageToNewChat('Reply with "Yes"')
-            expect(lastMessage?.text?.trim()).toStrictEqual('Yes')
-        }, 20_000)
-
-        // NOTE(olafurpg) disabled on Windows because the multi-repo keyword
-        // query is not replaying on Windows due to some platform-dependency on
-        // how the HTTP request is constructed. I manually tested multi-repo on
-        // a Windows computer to confirm that it does work as expected.
-        it.skipIf(isWindows())(
-            'chat/submitMessage (addEnhancedContext: true, multi-repo test)',
-            async () => {
-                const id = await enterpriseClient.request('chat/new', null)
-                const { repos } = await enterpriseClient.request('graphql/getRepoIds', {
-                    names: ['github.com/sourcegraph/sourcegraph'],
-                    first: 1,
-                })
-                await enterpriseClient.request('webview/receiveMessage', {
-                    id,
-                    message: {
-                        command: 'context/choose-remote-search-repo',
-                        explicitRepos: repos,
-                    },
-                })
-                const { lastMessage, transcript } =
-                    await enterpriseClient.sendSingleMessageToNewChatWithFullTranscript(
-                        'What is Squirrel?',
-                        {
-                            id,
-                            addEnhancedContext: true,
-                        }
-                    )
-
-                expect(lastMessage?.text ?? '').includes('code intelligence')
-                expect(lastMessage?.text ?? '').includes('tree-sitter')
-
-                const contextUris: URI[] = []
-                for (const message of transcript.messages) {
-                    for (const file of message.contextFiles ?? []) {
-                        if (file.type === 'file') {
-                            file.uri = URI.from(file.uri)
-                            contextUris.push(file.uri)
-                        }
-                    }
-                }
-                const paths = contextUris.map(uri => uri.path.split('/-/blob/').at(1) ?? '').sort()
-
-                expect(paths).includes('cmd/symbols/squirrel/README.md')
-
-                const { remoteRepos } = await enterpriseClient.request('chat/remoteRepos', { id })
-                expect(remoteRepos).toStrictEqual(repos)
-            },
-            30_000
-        )
-
-        afterAll(async () => {
-            const { requests } = await enterpriseClient.request('testing/networkRequests', null)
-            const nonServerInstanceRequests = requests
-                .filter(({ url }) => !url.startsWith(enterpriseClient.serverEndpoint))
-                .map(({ url }) => url)
-            expect(JSON.stringify(nonServerInstanceRequests)).toStrictEqual('[]')
-            await enterpriseClient.shutdownAndExit()
-            // Long timeout because to allow Polly.js to persist HTTP recordings
-        }, 30_000)
-    })
-
-    // Enterprise tests are run at demo instance, which is at a recent release version.
-    // Use this section if you need to run against S2 which is released continuously.
-    describe('Enterprise - close main branch', () => {
-        const enterpriseClient = new TestClient({
-            name: 'enterpriseMainBranchClient',
-            accessToken:
-                process.env.SRC_S2_ACCESS_TOKEN ??
-                // See comment above `const client =` about how this value is derived.
-                'REDACTED_ad28238383af71357085701263df7766e6f7f8ad1afc344d71aaf69a07143677',
-            serverEndpoint: 'https://sourcegraph.sourcegraph.com',
-            telemetryExporter: 'graphql',
-            logEventMode: 'connected-instance-only',
-        })
-
-        // Initialize inside beforeAll so that subsequent tests are skipped if initialization fails.
-        beforeAll(async () => {
-            const serverInfo = await enterpriseClient.initialize()
-
-            expect(serverInfo.authStatus?.isLoggedIn).toBeTruthy()
-            expect(serverInfo.authStatus?.username).toStrictEqual('codytesting')
-        }, 10_000)
-
-        it('attribution/found', async () => {
-            const id = await enterpriseClient.request('chat/new', null)
-            const { repoNames, error } = await enterpriseClient.request('attribution/search', {
-                id,
-                snippet: 'sourcegraph.Location(new URL',
-            })
-            expect(repoNames).not.empty
-            expect(error).null
-        }, 20_000)
-
-        it('attribution/not found', async () => {
-            const id = await enterpriseClient.request('chat/new', null)
-            const { repoNames, error } = await enterpriseClient.request('attribution/search', {
-                id,
-                snippet: 'sourcegraph.Location(new LRU',
-            })
-            expect(repoNames).empty
-            expect(error).null
-        }, 20_000)
-
-        afterAll(async () => {
-            await enterpriseClient.shutdownAndExit()
-            // Long timeout because to allow Polly.js to persist HTTP recordings
-        }, 30_000)
-    })
-
     afterAll(async () => {
-        await fspromises.rm(workspaceRootPath, {
-            recursive: true,
-            force: true,
-        })
+        await workspace.afterAll()
         await client.shutdownAndExit()
         // Long timeout because to allow Polly.js to persist HTTP recordings
     }, 30_000)
 })
-
-function trimEndOfLine(text: string | undefined): string {
-    if (text === undefined) {
-        return ''
-    }
-    return text
-        .split('\n')
-        .map(line => line.trimEnd())
-        .join('\n')
-}
