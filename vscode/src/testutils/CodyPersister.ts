@@ -1,21 +1,32 @@
-import crypto from 'crypto'
+// TODO: This potentially introduces some breaking behaviour compared to the previous one.
+// When the playwright E2E lands properly we should re-record all agent tests
+// with this updated recorder.
 
-import type { Har } from '@pollyjs/persister'
+import crypto from 'node:crypto'
+
+import type { Har, HarEntry } from '@pollyjs/persister'
 import FSPersister from '@pollyjs/persister-fs'
-
+import { type CompletionData, isError, parseEvents } from '@sourcegraph/cody-shared'
+import { CompletionsResponseBuilder } from '@sourcegraph/cody-shared/src/sourcegraph-api/completions/CompletionsResponseBuilder'
+import { PollyYamlWriter } from './PollyYamlWriter'
 import { decodeCompressedBase64 } from './base64'
-import { PollyYamlWriter } from './pollyapi'
 
+const AUTH_HEADER_REGEX = /^(?<prefix>token|bearer)\s+(?<redacted>REDACTED_)?(?<token>.*?)\s*$/im
 /**
  * SHA-256 digests a Sourcegraph access token so that it's value is redacted but
  * remains uniquely identifyable. The token needs to be uniquely identifiable so
  * that we can correctly replay HTTP responses based on the access token.
  */
-export function redactAccessToken(token: string): string {
-    if (token.startsWith('token REDACTED_')) {
-        return token
+export function redactAuthorizationHeader(header: string): string {
+    const match = AUTH_HEADER_REGEX.exec(header)
+    if (match) {
+        if (match.groups?.redacted) {
+            return header
+        }
+        const tokenHash = sha256(`prefix${match.groups?.token}`)
+        return `${match.groups?.prefix} REDACTED_${tokenHash}`
     }
-    return `token REDACTED_${sha256(`prefix${token}`)}`
+    return header
 }
 
 function sha256(input: string): string {
@@ -47,7 +58,7 @@ export class CodyPersister extends FSPersister {
         this.api = new PollyYamlWriter(this.options.recordingsDir)
     }
     public static get id(): string {
-        return 'cody-fs'
+        return 'fs'
     }
 
     public async onFindRecording(recordingId: string): Promise<Har | null> {
@@ -85,9 +96,9 @@ export class CodyPersister extends FSPersister {
             // and to remove any access tokens.
             const headers = [...entry.request.headers, ...entry.response.headers]
             for (const header of headers) {
-                switch (header.name) {
+                switch (header.name.toLowerCase()) {
                     case 'authorization':
-                        header.value = redactAccessToken(header.value)
+                        header.value = redactAuthorizationHeader(header.value)
                         break
                     // We should not harcode the dates to minimize diffs because
                     // that breaks the expiration feature in Polly.
@@ -97,20 +108,18 @@ export class CodyPersister extends FSPersister {
             // Remove any headers and cookies we don't need at all.
             entry.request.headers = this.filterHeaders(entry.request.headers)
             entry.response.headers = this.filterHeaders(entry.response.headers)
+            entry.response.content.text
             entry.request.cookies.length = 0
             entry.response.cookies.length = 0
+            entry.response.content.text = this.postProcessHarEntryResponse(entry)
 
-            // And other misc fields.
-            entry.time = 0
-            entry.timings = {
-                blocked: -1,
-                connect: -1,
-                dns: -1,
-                receive: 0,
-                send: 0,
-                ssl: -1,
-                wait: 0,
-            }
+            // Compared to V1 we don't nullify time fields as instead they can be configured on
+            // playback with adjustable speed. This makes it much easier to play
+            // back a test at the original recorded speed.
+
+            // entry.time = 0
+            // entry.timings = {}
+
             const responseContent = entry.response.content
             if (
                 responseContent?.encoding === 'base64' &&
@@ -135,10 +144,33 @@ export class CodyPersister extends FSPersister {
         return super.onSaveRecording(recordingId, recording)
     }
 
+    private postProcessHarEntryResponse(entry: HarEntry): string | undefined {
+        const { text } = entry.response.content
+        if (text === undefined) {
+            return undefined
+        }
+        if (
+            !entry.request.url.includes('/.api/completions/stream') &&
+            !entry.request.url.includes('/completions/code')
+        ) {
+            return text
+        }
+        return postProcessCompletionsStreamText(entry.request.url, text)
+    }
+
     private filterHeaders(
         headers: { name: string; value: string }[]
     ): { name: string; value: string }[] {
-        const removeHeaderNames = new Set(['set-cookie', 'server', 'via'])
+        const removeHeaderNames = new Set([
+            'set-cookie',
+            'x-sourcegraph-interaction-id',
+            'server',
+            'via',
+            'x-sourcegraph-actor-anonymous-uid',
+            //TODO(rnauta): leaky abstraction, how to configure this on the other end
+            'x-mitm-proxy-endpoint',
+            'x-mitm-auth-available',
+        ])
         const removeHeaderPrefixes = ['x-trace', 'cf-']
         return headers.filter(
             header =>
@@ -146,4 +178,47 @@ export class CodyPersister extends FSPersister {
                 removeHeaderPrefixes.every(prefix => !header.name.startsWith(prefix))
         )
     }
+}
+
+export function postProcessCompletionsStreamText(url: string, text: string): string | undefined {
+    const builder = CompletionsResponseBuilder.fromUrl(url)
+    const parseResult = parseEvents(builder, text)
+    if (isError(parseResult)) {
+        return text
+    }
+    const hasError = parseResult.events.some(event => event.type === 'error')
+    if (hasError) {
+        return text
+    }
+
+    const [completionEvent, doneEvent] = parseResult.events.slice(-2)
+    if (completionEvent?.type !== 'completion' || doneEvent?.type !== 'done') {
+        return text
+    }
+
+    const data: CompletionData =
+        builder.apiVersion >= 2
+            ? {
+                  deltaText: completionEvent.completion,
+                  stopReason: completionEvent.stopReason,
+              }
+            : {
+                  completion: builder.totalCompletion,
+                  stopReason: completionEvent.stopReason,
+              }
+
+    // NOTE(olafurpg) after api-version=2, we send delta text on SSE events
+    // instead of the full completion including prefix. This was a huge performance
+    // win but it's impractical for the HTTP record/replay format where we want
+    // to generate as few lines as possible. For this reason, we post-process
+    // the api-version=2 output to make it look like api-version=1 where the
+    // full completion is included via `.completion`.
+    const result = `event: completion
+data: ${JSON.stringify(data)}
+
+event: done
+data: {}
+
+`
+    return result
 }

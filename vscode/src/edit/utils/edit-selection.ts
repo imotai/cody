@@ -1,18 +1,8 @@
 import * as vscode from 'vscode'
 
 import { getSmartSelection } from '../../editor/utils'
-import { MAX_CURRENT_FILE_TOKENS, tokensToChars } from '@sourcegraph/cody-shared'
-
-/**
- * Checks if the current selection and editor represent a generate intent.
- * A generate intent means the user has an empty selection on an empty line.
- */
-export function isGenerateIntent(
-    document: vscode.TextDocument,
-    selection: vscode.Selection | vscode.Range
-): boolean {
-    return selection.isEmpty && document.lineAt(selection.start.line).isEmptyOrWhitespace
-}
+import type { EditIntent } from '../types'
+import { getEditIntent } from './edit-intent'
 
 interface SmartSelectionOptions {
     forceExpand?: boolean
@@ -33,7 +23,8 @@ interface SmartSelectionOptions {
 export async function getEditSmartSelection(
     document: vscode.TextDocument,
     selectionRange: vscode.Range,
-    { forceExpand }: SmartSelectionOptions = {}
+    { forceExpand }: SmartSelectionOptions = {},
+    intent?: EditIntent
 ): Promise<vscode.Range> {
     // Use selectionRange when it's available
     if (!forceExpand && selectionRange && !selectionRange?.start.isEqual(selectionRange.end)) {
@@ -41,7 +32,7 @@ export async function getEditSmartSelection(
     }
 
     // Return original (empty) range if we will resolve to generate new code
-    if (!forceExpand && isGenerateIntent(document, selectionRange)) {
+    if (!forceExpand && getEditIntent(document, selectionRange, intent) === 'add') {
         return selectionRange
     }
 
@@ -50,15 +41,14 @@ export async function getEditSmartSelection(
     // If we find a new expanded selection position then we set it as the new start position
     // and if we don't then we fallback to the original selection made by the user
     const newSelectionStartingPosition =
-        (await getSmartSelection(document, activeCursorStartPosition.line))?.start ||
-        selectionRange.start
+        (await getSmartSelection(document, activeCursorStartPosition))?.start || selectionRange.start
 
     // Retrieve the ending line of the current selection
     const activeCursorEndPosition = selectionRange.end
     // If we find a new expanded selection position then we set it as the new ending position
     // and if we don't then we fallback to the original selection made by the user
     const newSelectionEndingPosition =
-        (await getSmartSelection(document, activeCursorEndPosition.line))?.end || selectionRange.end
+        (await getSmartSelection(document, activeCursorEndPosition))?.end || selectionRange.end
 
     // Create a new range that starts from the beginning of the folding range at the start position
     // and ends at the end of the folding range at the end position.
@@ -70,43 +60,71 @@ export async function getEditSmartSelection(
     )
 }
 
-const MAXIMUM_EDIT_SELECTION_LENGTH = tokensToChars(MAX_CURRENT_FILE_TOKENS)
-
 /**
- * Expands the selection to encompass as much of the document as we can include as context to the LLM.
+ * Expands the selection to include all non-whitespace characters from the selected lines.
+ * This is to help produce consistent edits regardless of user behaviour.
  */
-export function getEditMaximumSelection(
+export function getEditLineSelection(
     document: vscode.TextDocument,
-    selectionRange: vscode.Range
+    selection: vscode.Range,
+    { forceExpand }: SmartSelectionOptions = {}
 ): vscode.Range {
-    let expandedRange = selectionRange
-    let charCount = document.getText(expandedRange).length
-
-    while (charCount < MAXIMUM_EDIT_SELECTION_LENGTH) {
-        const newStartLine = expandedRange.start.line > 0 ? expandedRange.start.line - 1 : 0
-        const newEndLine =
-            expandedRange.end.line < document.lineCount - 1
-                ? expandedRange.end.line + 1
-                : document.lineCount - 1
-
-        const newRange = new vscode.Range(
-            newStartLine,
-            0,
-            newEndLine,
-            document.lineAt(newEndLine).text.length
-        )
-        const newCharCount = document.getText(newRange).length
-
-        if (
-            newCharCount > MAXIMUM_EDIT_SELECTION_LENGTH ||
-            (newStartLine === 0 && newEndLine === document.lineCount - 1)
-        ) {
-            break // Stop expanding if the next expansion goes over the limit or the entire document is selected
-        }
-
-        expandedRange = newRange
-        charCount = newCharCount
+    if (selection.isEmpty && !forceExpand) {
+        // No selection to expand, do nothing
+        return selection
     }
 
-    return expandedRange
+    const startChar = document.lineAt(selection.start.line).firstNonWhitespaceCharacterIndex
+    const endChar = document.lineAt(selection.end.line).text.length
+    return new vscode.Range(selection.start.line, startChar, selection.end.line, endChar)
+}
+
+/**
+ * Given a provided user selection, adjust this to match an more optimal, realistic selection.
+ * This helps reduce the chance of user errors where an Edit may be triggered with either:
+ * - Too little text selected (e.g. the user selected all but a few chars of a function)
+ * - Too much text selected (e.g. a user selected a function, and some extra lines of whitespace)
+ *
+ * We expand, and then trim the selection to match only the intended non-whitespace characters
+ */
+export function getEditAdjustedUserSelection(
+    document: vscode.TextDocument,
+    selection: vscode.Selection
+): vscode.Range {
+    if (selection.isEmpty) {
+        // No selection provided, do nothing
+        return selection
+    }
+
+    // Expand the selection to include all non-whitespace characters from the selected lines
+    const lineSelection = getEditLineSelection(document, selection)
+    const text = document.getText(lineSelection)
+
+    // Trim any additional whitespace characters (e.g. additional lines) from the selection
+    const trimmedText = text.trim()
+    const startOffset = document.offsetAt(lineSelection.start) + text.indexOf(trimmedText)
+    const endOffset = startOffset + trimmedText.length
+
+    return new vscode.Selection(document.positionAt(startOffset), document.positionAt(endOffset))
+}
+
+/**
+ * Returns a range that represents the default provided range for an edit operation.
+ *
+ * If the user has made an active selection, the function will return the line-expanded
+ * selection range. Otherwise, it will return `undefined`, indicating that no default
+ * range is available.
+ */
+export function getEditDefaultProvidedRange(
+    document: vscode.TextDocument,
+    selection: vscode.Selection
+): vscode.Range | undefined {
+    if (!selection.isEmpty) {
+        // User has made an active selection.
+        // We have to use their selection as the intended range.
+        return getEditLineSelection(document, selection)
+    }
+
+    // No usable selection, fallback to the range expansion behaviour for Edit
+    return
 }

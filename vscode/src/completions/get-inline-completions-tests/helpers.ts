@@ -1,68 +1,85 @@
 import dedent from 'dedent'
-import { isEqual } from 'lodash'
-import { expect } from 'vitest'
+import { Observable } from 'observable-fns'
+import { vi } from 'vitest'
+import type { URI } from 'vscode-uri'
 
 import {
-    CompletionStopReason,
-    testFileUri,
+    AUTH_STATUS_FIXTURE_AUTHED,
+    AUTH_STATUS_FIXTURE_AUTHED_DOTCOM,
+    type AuthenticatedAuthStatus,
+    type AutocompleteProviderID,
+    CLIENT_CAPABILITIES_FIXTURE,
+    ClientConfigSingleton,
     type CodeCompletionsClient,
+    type CodyClientConfig,
+    type CodyLLMSiteConfiguration,
     type CompletionParameters,
     type CompletionResponse,
-    type CompletionResponseGenerator,
-    type Configuration,
+    CompletionStopReason,
+    currentAuthStatusOrNotReadyYet,
+    featureFlagProvider,
+    mockAuthStatus,
+    mockClientCapabilities,
+    mockResolvedConfig,
+    setEditorWindowIsFocused,
+    testFileUri,
 } from '@sourcegraph/cody-shared'
+import type {
+    CodeCompletionsParams,
+    CompletionResponseWithMetaData,
+} from '@sourcegraph/cody-shared/src/inferenceClient/misc'
 
+import { ContextRankingStrategy } from '../../completions/context/completions-context-ranker'
+import { DEFAULT_VSCODE_SETTINGS } from '../../testutils/mocks'
 import type { SupportedLanguage } from '../../tree-sitter/grammars'
 import { updateParseTreeCache } from '../../tree-sitter/parse-tree-cache'
 import { getParser } from '../../tree-sitter/parser'
+import { AutocompleteStageRecorder, type CompletionLogID } from '../analytics-logger'
 import { ContextMixer } from '../context/context-mixer'
 import { DefaultContextStrategyFactory } from '../context/context-strategy'
 import { getCompletionIntent } from '../doc-context-getters'
 import { getCurrentDocContext } from '../get-current-doc-context'
 import {
-    TriggerKind,
-    getInlineCompletions as _getInlineCompletions,
     type InlineCompletionsParams,
     type InlineCompletionsResult,
+    TriggerKind,
+    getInlineCompletions as _getInlineCompletions,
 } from '../get-inline-completions'
-import {
-    createProviderConfig,
-    MULTI_LINE_STOP_SEQUENCES,
-    SINGLE_LINE_STOP_SEQUENCES,
-} from '../providers/anthropic'
-import type { ProviderOptions } from '../providers/provider'
+import { createProvider as createAnthropicProvider } from '../providers/anthropic'
+import { createProvider as createFireworksProvider } from '../providers/fireworks'
+import { pressEnterAndGetIndentString } from '../providers/shared/hot-streak'
+import type { GenerateCompletionsOptions } from '../providers/shared/provider'
 import { RequestManager } from '../request-manager'
-import { documentAndPosition, sleep } from '../test-helpers'
-import { pressEnterAndGetIndentString } from '../providers/hot-streak'
-import { completionProviderConfig } from '../completion-provider-config'
-import { emptyMockFeatureFlagProvider } from '../../testutils/mocks'
+import { documentAndPosition } from '../test-helpers'
+import { sleep } from '../utils'
 
 // The dedent package seems to replace `\t` with `\\t` so in order to insert a tab character, we
 // have to use interpolation. We abbreviate this to `T` because ${T} is exactly 4 characters,
 // mimicking the default indentation of four spaces
 export const T = '\t'
 
-const URI_FIXTURE = testFileUri('test.ts')
-
-type Params = Partial<Omit<InlineCompletionsParams, 'document' | 'position' | 'docContext'>> & {
+export type Params = Partial<Omit<InlineCompletionsParams, 'document' | 'position' | 'docContext'>> & {
     languageId?: string
     takeSuggestWidgetSelectionIntoAccount?: boolean
-    onNetworkRequest?: (params: CompletionParameters) => void
+    onNetworkRequest?: (params: CodeCompletionsParams, abortController: AbortController) => void
     completionResponseGenerator?: (
         params: CompletionParameters
-    ) => CompletionResponseGenerator | Generator<CompletionResponse>
-    providerOptions?: Partial<ProviderOptions>
-    configuration?: Partial<Configuration>
+    ) => Generator<CompletionResponse> | AsyncGenerator<CompletionResponse>
+    configuration?: Parameters<typeof mockResolvedConfig>[0]
+    authStatus?: AuthenticatedAuthStatus
+    configOverwrites?: CodyLLMSiteConfiguration | null
+    documentUri?: URI
 }
 
-interface ParamsResult extends InlineCompletionsParams {
+export interface ParamsResult extends Omit<InlineCompletionsParams, 'configuration' | 'authStatus'> {
     /**
      * A promise that's resolved once `completionResponseGenerator` is done.
      * Used to wait for all the completion response chunks to be processed by the
      * request manager in autocomplete tests.
      */
     completionResponseGeneratorPromise: Promise<unknown>
-    configuration?: Partial<Configuration>
+    configuration?: Parameters<typeof mockResolvedConfig>[0]
+    authStatus?: AuthenticatedAuthStatus
 }
 
 /**
@@ -72,20 +89,30 @@ interface ParamsResult extends InlineCompletionsParams {
  */
 export function params(
     code: string,
-    responses: CompletionResponse[] | 'never-resolve',
-    params: Params = {}
-): ParamsResult {
-    const {
+    responses: CompletionResponse[] | CompletionResponseWithMetaData[] | 'never-resolve',
+    {
         languageId = 'typescript',
         onNetworkRequest,
         completionResponseGenerator,
         triggerKind = TriggerKind.Automatic,
         selectedCompletionInfo,
         takeSuggestWidgetSelectionIntoAccount,
-        isDotComUser = false,
-        providerOptions,
+        configuration: config,
+        documentUri = testFileUri('test.ts'),
+        configOverwrites = null,
         ...restParams
-    } = params
+    }: Params = {}
+): ParamsResult {
+    const currentAuthStatus = currentAuthStatusOrNotReadyYet()
+
+    const authStatus =
+        // If authStatus is not explicitly provided, check the current value, which
+        // might be mocked prior to calling this function.
+        restParams.authStatus || currentAuthStatus?.authenticated
+            ? (currentAuthStatus! as AuthenticatedAuthStatus)
+            : AUTH_STATUS_FIXTURE_AUTHED_DOTCOM
+
+    mockAuthStatus(authStatus)
 
     let requestCounter = 0
     let resolveCompletionResponseGenerator: (value?: unknown) => void
@@ -93,13 +120,18 @@ export function params(
         resolveCompletionResponseGenerator = resolve
     })
 
-    const client: Pick<CodeCompletionsClient, 'complete'> = {
-        async *complete(completeParams) {
-            onNetworkRequest?.(completeParams)
+    const client: CodeCompletionsClient = {
+        async *complete(completeParams, abortController) {
+            onNetworkRequest?.(completeParams, abortController)
 
             if (completionResponseGenerator) {
                 for await (const response of completionResponseGenerator(completeParams)) {
-                    yield { ...response, stopReason: CompletionStopReason.StreamingChunk }
+                    yield {
+                        completionResponse: {
+                            ...response,
+                            stopReason: CompletionStopReason.StreamingChunk,
+                        },
+                    }
                 }
 
                 // Signal to tests that all streaming chunks are processed.
@@ -110,16 +142,40 @@ export function params(
                 return new Promise(() => {})
             }
 
-            return responses[requestCounter++] || { completion: '', stopReason: 'unknown' }
+            const response = responses[requestCounter++]
+
+            if (response && 'completionResponse' in response) {
+                return response
+            }
+
+            return {
+                completionResponse: (response as CompletionResponse) || {
+                    completion: '',
+                    stopReason: 'unknown',
+                },
+            }
         },
+        logger: undefined,
     }
 
-    const providerConfig = createProviderConfig({
-        client,
-        providerOptions,
+    // TODO: add support for `createProvider` from `vscode/src/completions/providers/shared/create-provider.ts`
+    const createProvider =
+        config?.configuration?.autocompleteAdvancedProvider === 'fireworks'
+            ? createFireworksProvider
+            : createAnthropicProvider
+
+    const provider = createProvider({
+        legacyModel: config?.configuration?.autocompleteAdvancedModel!,
+        provider:
+            (config?.configuration?.autocompleteAdvancedModel as AutocompleteProviderID) || 'anthropic',
+        source: 'local-editor-settings',
+        authStatus,
+        configOverwrites,
     })
 
-    const { document, position } = documentAndPosition(code, languageId, URI_FIXTURE.toString())
+    provider.client = client
+
+    const { document, position } = documentAndPosition(code, languageId, documentUri.toString())
 
     const parser = getParser(document.languageId as SupportedLanguage)
     if (parser) {
@@ -129,9 +185,8 @@ export function params(
     const docContext = getCurrentDocContext({
         document,
         position,
-        maxPrefixLength: 1000,
-        maxSuffixLength: 1000,
-        dynamicMultilineCompletions: false,
+        maxPrefixLength: provider.contextSizeHints.prefixChars,
+        maxSuffixLength: provider.contextSizeHints.suffixChars,
         context: takeSuggestWidgetSelectionIntoAccount
             ? {
                   triggerKind: 0,
@@ -145,20 +200,29 @@ export function params(
     }
 
     return {
+        authStatus,
+        configuration: config ?? { configuration: {}, auth: {} },
         document,
         position,
         docContext,
         triggerKind,
         selectedCompletionInfo,
-        providerConfig,
+        provider,
+        firstCompletionTimeout:
+            config?.configuration?.autocompleteFirstCompletionTimeout ??
+            DEFAULT_VSCODE_SETTINGS.autocompleteFirstCompletionTimeout,
         requestManager: new RequestManager(),
-        contextMixer: new ContextMixer(new DefaultContextStrategyFactory('none')),
+        contextMixer: new ContextMixer({
+            strategyFactory: new DefaultContextStrategyFactory(Observable.of('none')),
+            contextRankingStrategy: ContextRankingStrategy.Default,
+        }),
+        smartThrottleService: null,
         completionIntent: getCompletionIntent({
             document,
             position,
             prefix: docContext.prefix,
         }),
-        isDotComUser,
+        stageRecorder: new AutocompleteStageRecorder({ isPreloadRequest: false }),
         ...restParams,
 
         // Test-specific helpers
@@ -253,6 +317,7 @@ export function paramsWithInlinedCompletion(
 
 interface GetInlineCompletionResult extends Omit<ParamsResult & InlineCompletionsResult, 'logId'> {
     acceptFirstCompletionAndPressEnter(): Promise<GetInlineCompletionResult>
+    pressEnter(): Promise<GetInlineCompletionResult>
 }
 
 /**
@@ -275,9 +340,7 @@ export async function getInlineCompletionsWithInlinedChunks(
         throw new Error('This test helpers should always return a result')
     }
 
-    const acceptFirstCompletionAndPressEnter = () => {
-        const [{ insertText }] = result.items
-
+    const pressEnter = (insertText = '') => {
         const newLineString = pressEnterAndGetIndentString(
             insertText,
             params.docContext.currentLinePrefix,
@@ -299,7 +362,22 @@ export async function getInlineCompletionsWithInlinedChunks(
         })
     }
 
-    return { ...params, ...result, acceptFirstCompletionAndPressEnter }
+    const acceptFirstCompletionAndPressEnter = () => {
+        return pressEnter(result.items[0].insertText)
+    }
+
+    return { ...params, ...result, acceptFirstCompletionAndPressEnter, pressEnter }
+}
+
+/**
+ * Helper to access `getInlineCompletions` in tests.
+ * Unlike `getInlineCompletions`, this returns the full response, including `logId`.
+ */
+export async function getInlineCompletionsFullResponse(
+    params: ParamsResult
+): Promise<InlineCompletionsResult | null> {
+    initCompletionProviderConfig(params)
+    return await _getInlineCompletions(params)
 }
 
 /**
@@ -309,22 +387,17 @@ export async function getInlineCompletionsWithInlinedChunks(
 export async function getInlineCompletions(
     params: ParamsResult
 ): Promise<Omit<InlineCompletionsResult, 'logId'> | null> {
-    const { configuration = {} } = params
-    await initCompletionProviderConfig(configuration)
-
-    const result = await _getInlineCompletions(params)
-
-    if (result) {
-        const { logId: _discard, ...rest } = result
-
-        return {
-            ...rest,
-            items: result.items.map(({ stopReason: discard, ...item }) => item),
-        }
+    const result = await getInlineCompletionsFullResponse(params)
+    if (!result) {
+        return null
     }
 
-    completionProviderConfig.setConfig({} as Configuration)
-    return result
+    const { logId: _discard, ...rest } = result
+
+    return {
+        ...rest,
+        items: result.items.map(({ stopReason: discard, ...item }) => item),
+    }
 }
 
 /** Test helper for when you just want to assert the completion strings. */
@@ -335,39 +408,41 @@ export async function getInlineCompletionsInsertText(params: ParamsResult): Prom
 
 export type V = Awaited<ReturnType<typeof getInlineCompletions>>
 
-export function initCompletionProviderConfig(config: Partial<Configuration>) {
-    return completionProviderConfig.init(config as Configuration, emptyMockFeatureFlagProvider)
+export function initCompletionProviderConfig({
+    configuration,
+    authStatus,
+}: Partial<Pick<ParamsResult, 'configuration' | 'authStatus'>>): void {
+    setEditorWindowIsFocused(() => true)
+    vi.spyOn(featureFlagProvider, 'evaluateFeatureFlagEphemerally').mockResolvedValue(false)
+    vi.spyOn(featureFlagProvider, 'evaluatedFeatureFlag').mockReturnValue(Observable.of(false))
+    vi.spyOn(ClientConfigSingleton.getInstance(), 'getConfig').mockResolvedValue({
+        autoCompleteEnabled: true,
+        modelsAPIEnabled: false,
+    } satisfies Partial<CodyClientConfig> as CodyClientConfig)
+    mockAuthStatus(authStatus ?? AUTH_STATUS_FIXTURE_AUTHED)
+    mockResolvedConfig({
+        configuration: { ...configuration?.configuration },
+        auth: { serverEndpoint: 'https://example.com', ...configuration?.auth },
+        clientState: { modelPreferences: {}, ...configuration?.clientState },
+    })
+    mockClientCapabilities(CLIENT_CAPABILITIES_FIXTURE)
 }
 
-expect.extend({
-    /**
-     * Checks if `CompletionParameters[]` contains one item with single-line stop sequences.
-     */
-    toBeSingleLine(requests: CompletionParameters[], _) {
-        const { isNot } = this
-
-        return {
-            pass:
-                requests.length === 1 && isEqual(requests[0]?.stopSequences, SINGLE_LINE_STOP_SEQUENCES),
-            message: () => `Completion requests are${isNot ? ' not' : ''} single-line`,
-            actual: requests.map(r => ({ stopSequences: r.stopSequences })),
-            expected: [{ stopSequences: SINGLE_LINE_STOP_SEQUENCES }],
-        }
-    },
-    /**
-     * Checks if `CompletionParameters[]` contains three items with multi-line stop sequences.
-     */
-    toBeMultiLine(requests: CompletionParameters[], _) {
-        const { isNot } = this
-
-        return {
-            pass:
-                requests.length === 3 && isEqual(requests[0]?.stopSequences, MULTI_LINE_STOP_SEQUENCES),
-            message: () => `Completion requests are${isNot ? ' not' : ''} multi-line`,
-            actual: requests.map(r => ({ stopSequences: r.stopSequences })),
-            expected: Array.from({ length: 3 }).map(() => ({
-                stopSequences: MULTI_LINE_STOP_SEQUENCES,
-            })),
-        }
-    },
-})
+export function getMockedGenerateCompletionsOptions({
+    configOverwrites,
+}: Pick<Params, 'configOverwrites'> = {}): GenerateCompletionsOptions {
+    const { position, document, docContext, triggerKind } = params('const value = █', [], {
+        configOverwrites,
+    })
+    return {
+        position,
+        document,
+        docContext,
+        multiline: false,
+        triggerKind,
+        snippets: [],
+        numberOfCompletionsToGenerate: 1,
+        firstCompletionTimeout: 5_000,
+        completionLogId: 'test-log-id' as CompletionLogID,
+    }
+}

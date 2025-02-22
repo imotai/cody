@@ -1,6 +1,7 @@
 import { URI } from 'vscode-uri'
 
-import { pathFunctionsForURI, posixAndURIPaths } from '../common/path'
+import { pathFunctionsForURI, posixFilePaths, windowsFilePaths } from '../common/path'
+import { type RangeData, displayLineRange } from '../common/range'
 
 /**
  * Convert an absolute URI to a (possibly shorter) path to display to the user. The display path is
@@ -28,6 +29,18 @@ export function displayPath(location: URI): string {
 }
 
 /**
+ * Displays the path of a URI {@link displayPath} with zero-based line values extracted from range.
+ * Example: `src/foo/bar.ts:5-10`
+ *
+ * @param location - The URI to display the path for.
+ * @param range - The line range data to display.
+ * @returns The formatted path with the start and end lines of the range appended to it.
+ */
+export function displayPathWithLines(location: URI, range: RangeData): string {
+    return `${displayPath(location)}:${displayLineRange(range)}`
+}
+
+/**
  * Dirname of the location's display path, to display to the user. Similar to
  * `dirname(displayPath(location))`, but it uses the right path separators in `dirname` ('\' for
  * file URIs on Windows, '/' otherwise).
@@ -50,10 +63,15 @@ export function displayPathDirname(location: URI): string {
     const envInfo = checkEnvInfo()
     const result = _displayPath(location, envInfo)
 
-    const dirname = pathFunctionsForURI(location, envInfo.isWindows).dirname
+    // File path.
     if (typeof result === 'string') {
-        return dirname(result)
+        // If the result is a string, it is a path (not a URI), so we must
+        // use the correct path functions.
+        return envInfo.isWindows ? windowsFilePaths.dirname(result) : posixFilePaths.dirname(result)
     }
+
+    // Otherwise, URI.
+    const dirname = pathFunctionsForURI(location, envInfo.isWindows).dirname
     return result.with({ path: dirname(result.path) }).toString()
 }
 
@@ -61,12 +79,19 @@ export function displayPathDirname(location: URI): string {
  * Similar to `basename(displayPath(location))`, but it uses the right path separators in `basename`
  * ('\' for file URIs on Windows, '/' otherwise).
  */
-export function displayPathBasename(location: URI): string {
+export function displayPathBasename(location: URI | string): string {
     const envInfo = checkEnvInfo()
-    const displayPath = _displayPath(location, envInfo)
-    return pathFunctionsForURI(location, envInfo.isWindows).basename(
-        typeof displayPath === 'string' ? displayPath : displayPath.path
-    )
+    const result = _displayPath(location, envInfo)
+
+    // File path.
+    if (typeof result === 'string') {
+        // If the result is a string, it is a path (not a URI), so we must
+        // use the correct path functions.
+        return envInfo.isWindows ? windowsFilePaths.basename(result) : posixFilePaths.basename(result)
+    }
+
+    // Otherwise, URI.
+    return posixFilePaths.basename(result.path)
 }
 
 /**
@@ -88,7 +113,7 @@ function checkEnvInfo(): DisplayPathEnvInfo {
 }
 
 function _displayPath(
-    location: URI,
+    location: URI | string,
     { workspaceFolders, isWindows }: DisplayPathEnvInfo,
     includeWorkspaceFolderWhenMultiple = true
 ): string | URI {
@@ -98,9 +123,10 @@ function _displayPath(
     const includeWorkspaceFolder = includeWorkspaceFolderWhenMultiple && workspaceFolders.length >= 2
     for (const folder of workspaceFolders) {
         if (uriHasPrefix(uri, folder, isWindows)) {
+            const pathFunctions = pathFunctionsForURI(folder)
             const workspacePrefix = folder.path.endsWith('/') ? folder.path.slice(0, -1) : folder.path
             const workspaceDisplayPrefix = includeWorkspaceFolder
-                ? posixAndURIPaths.basename(folder.path) + pathFunctionsForURI(folder).separator
+                ? pathFunctions.basename(folder.path) + pathFunctions.separator
                 : ''
             return fixPathSep(
                 workspaceDisplayPrefix + uri.path.slice(workspacePrefix.length + 1),

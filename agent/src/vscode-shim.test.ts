@@ -1,15 +1,16 @@
-import assert from 'assert'
-import * as fspromises from 'fs/promises'
-import os from 'os'
-import * as path from 'path'
+import assert from 'node:assert'
+import * as fspromises from 'node:fs/promises'
+import os from 'node:os'
+import * as path from 'node:path'
 
 import { rimraf } from 'rimraf'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { URI } from 'vscode-uri'
 
+import { AgentWorkspaceConfiguration } from './AgentWorkspaceConfiguration'
 import { AgentWorkspaceDocuments } from './AgentWorkspaceDocuments'
 import * as vscode from './vscode-shim'
-
+import { setWorkspaceFolders, workspaceFolders } from './vscode-shim'
 describe('vscode-shim', () => {
     describe('vscode.Uri', () => {
         it('static file() is available', () => {
@@ -105,6 +106,15 @@ describe.skipIf(os.platform().startsWith('win'))('vscode.workspace.fs', () => {
         expect(content).toEqual(testBuffer)
     })
 
+    it('writeFile in non-existent directory', async () => {
+        const testBuffer = Buffer.from('Hello')
+        const nonExistentDir = path.join(tmpdir.fsPath, 'non-existent')
+        const testFilePath = path.join(nonExistentDir, 'testFile')
+        await vscode.workspace.fs.writeFile(vscode.Uri.parse(testFilePath), new Uint8Array(testBuffer))
+        const content = await fspromises.readFile(testFilePath)
+        expect(content).toEqual(testBuffer)
+    })
+
     it('readFile', async () => {
         const testFilePath = path.join(tmpdir.fsPath, 'testFile')
         await fspromises.writeFile(testFilePath, 'Hello')
@@ -171,9 +181,11 @@ describe('vscode.workspace.findFiles', () => {
         const workspaceDocuments = new AgentWorkspaceDocuments()
         while (vscode.workspaceFolders.pop()) {
             // clear
+            // vscode.workspaceFolders will be reset by setWorkspaceDocuments.
         }
         workspaceDocuments.workspaceRootUri = tmpdir
         vscode.setWorkspaceDocuments(workspaceDocuments)
+        expect(vscode.workspaceFolders.length).toEqual(1)
         await fspromises.writeFile(path.join(tmpdir.fsPath, 'README.md'), '# Bananas are great')
         await fspromises.writeFile(path.join(tmpdir.fsPath, 'other.txt'), 'Other file')
         await fspromises.mkdir(path.join(tmpdir.fsPath, 'scripts'))
@@ -245,5 +257,179 @@ describe('vscode.workspace.findFiles', () => {
             "other.txt",
           ]
         `)
+    })
+})
+
+describe('vscode_shim.onDidChangeWorkspaceFolders', () => {
+    let originalWorkspaceFolders = [...workspaceFolders]
+
+    beforeEach(() => {
+        originalWorkspaceFolders = [...workspaceFolders]
+        workspaceFolders.length = 0
+    })
+
+    afterEach(() => {
+        workspaceFolders.length = 0
+        workspaceFolders.push(...originalWorkspaceFolders)
+    })
+
+    it('adds a new workspace folder when array is empty', () => {
+        const uri = vscode.Uri.file('/test/workspace')
+        const result = setWorkspaceFolders([uri])
+        expect(result).toHaveLength(1)
+        expect(result[0]).toEqual({
+            name: 'workspace',
+            uri,
+            index: 0,
+        })
+    })
+
+    it('removes a workspace folder', () => {
+        const uri1 = vscode.Uri.file('/test/workspace1')
+        const uri2 = vscode.Uri.file('/test/workspace2')
+        workspaceFolders.push(
+            { name: 'workspace1', uri: uri1, index: 0 },
+            { name: 'workspace2', uri: uri2, index: 1 }
+        )
+
+        const result = setWorkspaceFolders([uri2])
+        expect(result).toHaveLength(1)
+        expect(result[0]).toEqual({
+            name: 'workspace2',
+            uri: uri2,
+            index: 0,
+        })
+    })
+
+    it('updates indexes when removing a workspace folder', () => {
+        const uri1 = vscode.Uri.file('/test/workspace1')
+        const uri2 = vscode.Uri.file('/test/workspace2')
+        const uri3 = vscode.Uri.file('/test/workspace3')
+        workspaceFolders.push(
+            { name: 'workspace1', uri: uri1, index: 0 },
+            { name: 'workspace2', uri: uri2, index: 1 },
+            { name: 'workspace3', uri: uri3, index: 2 }
+        )
+
+        const result = setWorkspaceFolders([uri1, uri3])
+        expect(result).toHaveLength(2)
+        expect(result[0]).toEqual({
+            name: 'workspace1',
+            uri: uri1,
+            index: 0,
+        })
+        expect(result[1]).toEqual({
+            name: 'workspace3',
+            uri: uri3,
+            index: 1,
+        })
+    })
+
+    it('adds a new workspace folder to existing folders', () => {
+        const uri1 = vscode.Uri.file('/test/workspace1')
+        const uri2 = vscode.Uri.file('/test/workspace2')
+        workspaceFolders.push({ name: 'workspace2', uri: uri2, index: 0 })
+
+        const result = setWorkspaceFolders([uri1, uri2])
+        expect(result).toHaveLength(2)
+        expect(result[0]).toEqual({
+            name: 'workspace2',
+            uri: uri2,
+            index: 0,
+        })
+        expect(result[1]).toEqual({
+            name: 'workspace1',
+            uri: uri1,
+            index: 1,
+        })
+    })
+
+    it('returns an empty array when removing the last workspace folder', () => {
+        const uri = vscode.Uri.file('/test/workspace')
+        workspaceFolders.push({ name: 'workspace', uri, index: 0 })
+
+        const result = setWorkspaceFolders([])
+        expect(result).toHaveLength(0)
+    })
+})
+
+describe('vscode.workspace.getConfiguration', () => {
+    let configuration: AgentWorkspaceConfiguration
+
+    const clientInfo = {
+        name: 'vscode',
+        version: '1.0.0',
+        ideVersion: '1.80.0',
+        workspaceRootUri: '/',
+    }
+
+    const customConfigJson = `
+        {
+          "cody.experimental.noodle": true,
+          "openctx": {
+            "providers": {
+              "https://gist.githubusercontent.com/someuser/provider.js": true
+            },
+            "enable": true
+          }
+        }
+    `
+
+    const extensionConfig = {
+        serverEndpoint: 'https://sourcegraph.test',
+        customHeaders: { 'X-Test': 'test' },
+        telemetryClientName: 'test-client',
+        autocompleteAdvancedProvider: 'anthropic',
+        autocompleteAdvancedModel: 'claude-2',
+        verboseDebug: true,
+        codebase: 'test-repo',
+        customConfigurationJson: customConfigJson,
+    }
+
+    beforeEach(() => {
+        configuration = new AgentWorkspaceConfiguration(
+            [],
+            () => clientInfo,
+            () => extensionConfig
+        )
+        vscode.setClientInfo(clientInfo)
+        vscode.setExtensionConfiguration(extensionConfig)
+    })
+
+    it('returns full configuration when section is undefined', () => {
+        const newConfig = vscode.workspace.getConfiguration()
+        expect(newConfig.get('openctx')).toMatchObject(configuration.get('openctx'))
+    })
+
+    it('returns scoped configuration for valid section', () => {
+        const newConfig = vscode.workspace.getConfiguration('openctx')
+        expect(newConfig).toBeDefined()
+        expect(newConfig.get('providers')).toMatchObject(configuration.get('openctx.providers'))
+    })
+
+    it('ignores scope parameter when section is undefined', () => {
+        const newConfig = vscode.workspace.getConfiguration(undefined, vscode.Uri.file('/test'))
+        expect(newConfig.get('openctx')).toMatchObject(configuration.get('openctx'))
+    })
+
+    it('falls back to global scope for language-scoped configuration', () => {
+        const newConfig = vscode.workspace.getConfiguration('[jsonc]')
+        expect(newConfig.get('openctx')).toMatchObject(configuration.get('openctx'))
+    })
+
+    it('handles nested section paths', () => {
+        const config = vscode.workspace.getConfiguration('openctx.providers')
+        expect(config).toBeDefined()
+        expect(config.get('https://gist.githubusercontent.com/someuser/provider.js')).toMatchObject(
+            configuration.get(
+                'openctx.providers.https://gist.githubusercontent.com/someuser/provider.js'
+            )
+        )
+    })
+
+    it('returns same configuration regardless of scope when section is defined', () => {
+        const configNoScope = vscode.workspace.getConfiguration('openctx')
+        const configWithScope = vscode.workspace.getConfiguration('openctx', vscode.Uri.file('/test'))
+        expect(configNoScope.get('providers')).toEqual(configWithScope.get('providers'))
     })
 })

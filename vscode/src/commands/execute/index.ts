@@ -1,20 +1,23 @@
 import {
+    type ContextItem,
     DefaultChatCommands,
     type DefaultCodyCommands,
     DefaultEditCommands,
-} from '@sourcegraph/cody-shared/src/commands/types'
-import { executeSmellCommand } from './smell'
-import { executeExplainCommand } from './explain'
-import { executeTestChatCommand } from './test-chat'
+    PromptString,
+    ps,
+} from '@sourcegraph/cody-shared'
+import type { CommandResult } from '../../CommandResult'
+import { executeEdit } from '../../edit/execute'
+import type { CodyCommandArgs } from '../types'
 import { executeDocCommand } from './doc'
-import type { CommandResult } from '../../main'
+import { executeExplainCommand } from './explain'
+import { executeSmellCommand } from './smell'
 import { executeTestEditCommand } from './test-edit'
 
 export { commands as defaultCommands } from './cody.json'
 
 export { executeSmellCommand } from './smell'
 export { executeExplainCommand } from './explain'
-export { executeTestChatCommand } from './test-chat'
 export { executeDocCommand } from './doc'
 export { executeTestEditCommand } from './test-edit'
 export { executeTestCaseEditCommand } from './test-case'
@@ -45,22 +48,35 @@ export function isDefaultEditCommand(id: string): DefaultEditCommands | undefine
  */
 export async function executeDefaultCommand(
     id: DefaultCodyCommands | string,
-    additionalInstruction?: string
+    args?: CodyCommandArgs
 ): Promise<CommandResult | undefined> {
     const key = id.replace(/^\//, '').trim() as DefaultCodyCommands
     switch (key) {
         case DefaultChatCommands.Explain:
-            return executeExplainCommand({ additionalInstruction })
+            return executeExplainCommand(args)
         case DefaultChatCommands.Smell:
-            return executeSmellCommand({ additionalInstruction })
-        case DefaultChatCommands.Unit:
-            return executeTestChatCommand({ additionalInstruction })
+            return executeSmellCommand(args)
         case DefaultEditCommands.Test:
-            return executeTestEditCommand({ additionalInstruction })
+            return executeTestEditCommand(args)
         case DefaultEditCommands.Doc:
-            return executeDocCommand({ additionalInstruction })
+            return executeDocCommand(args)
+        case DefaultEditCommands.Edit:
+            return { task: await executeEdit(args || {}), type: 'edit' }
         default:
             console.log('not a default command')
             return undefined
     }
+}
+
+export function selectedCodePromptWithExtraFiles(
+    primary: ContextItem,
+    other: ContextItem[]
+): PromptString {
+    const primaryMention = ps`@${PromptString.fromDisplayPathLineRange(primary.uri, primary.range)}`
+    const otherMentions = other.map(
+        item => ps`@${PromptString.fromDisplayPathLineRange(item.uri, item.range)}`
+    )
+    return ps`${primaryMention}${
+        otherMentions.length > 0 ? ps` ( ${PromptString.join(otherMentions, ps` `)} )` : ''
+    }`
 }

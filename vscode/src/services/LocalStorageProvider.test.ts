@@ -1,9 +1,7 @@
-import assert from 'assert'
-
-import { beforeEach, describe, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import type * as vscode from 'vscode'
 
-import type { AuthStatus } from '../chat/protocol'
+import { AUTH_STATUS_FIXTURE_AUTHED, type UserLocalHistory } from '@sourcegraph/cody-shared'
 
 import { localStorage } from './LocalStorageProvider'
 
@@ -22,38 +20,14 @@ describe('LocalStorageProvider', () => {
         localStorageData = {}
     })
 
-    it('converts chat history without context files upon loading', async () => {
-        await localStorage.setChatHistory(DUMMY_AUTH_STATUS, {
-            chat: { a: null as any },
-            input: ['a', 'b', 'c'] as any, // API expects new format so cast any.
+    it('sets and gets chat history', async () => {
+        await localStorage.setChatHistory(AUTH_STATUS_FIXTURE_AUTHED, {
+            chat: { a: { id: 'a', lastInteractionTimestamp: '123', interactions: [] } },
         })
 
-        const loadedHistory = localStorage.getChatHistory(DUMMY_AUTH_STATUS)
-        assert.deepStrictEqual(loadedHistory, {
-            chat: { a: null },
-            input: [
-                // Expect new format with context files.
-                { inputText: 'a', inputContextFiles: [] },
-                { inputText: 'b', inputContextFiles: [] },
-                { inputText: 'c', inputContextFiles: [] },
-            ],
+        const loadedHistory = localStorage.getChatHistory(AUTH_STATUS_FIXTURE_AUTHED)
+        expect(loadedHistory).toEqual<UserLocalHistory>({
+            chat: { a: { id: 'a', lastInteractionTimestamp: '123', interactions: [] } },
         })
     })
 })
-
-const DUMMY_AUTH_STATUS: AuthStatus = {
-    endpoint: null,
-    isDotCom: true,
-    isLoggedIn: true,
-    showInvalidAccessTokenError: false,
-    authenticated: true,
-    hasVerifiedEmail: true,
-    requiresVerifiedEmail: true,
-    siteHasCodyEnabled: true,
-    siteVersion: '1234',
-    primaryEmail: 'heisenberg@exmaple.com',
-    username: 'uwu',
-    displayName: 'w.w.',
-    avatarURL: '',
-    userCanUpgrade: false,
-}

@@ -37,12 +37,21 @@ const EXTENSION_TO_LANGUAGE: { [key: string]: string } = {
     java: ProgrammingLanguage.Java,
     c: 'C',
     cpp: 'C++',
-    cs: 'C#',
+    cs: 'Csharp',
     css: 'CSS',
     html: 'HTML',
     json: 'JSON',
     rs: 'Rust',
     txt: ProgrammingLanguage.PlainText,
+}
+
+export function extensionForLanguage(language: string): string | undefined {
+    for (const extension of Object.keys(EXTENSION_TO_LANGUAGE)) {
+        if (EXTENSION_TO_LANGUAGE[extension] === language) {
+            return extension
+        }
+    }
+    return undefined
 }
 
 /**
