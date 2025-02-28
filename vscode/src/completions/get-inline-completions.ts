@@ -2,32 +2,39 @@ import type * as vscode from 'vscode'
 import type { URI } from 'vscode-uri'
 
 import {
-    FeatureFlag,
+    type AutocompleteContextSnippet,
+    type DocumentContext,
     getActiveTraceAndSpanId,
     isAbortError,
+    isDotComAuthed,
     wrapInActiveSpan,
 } from '@sourcegraph/cody-shared'
 
-import { logError } from '../log'
 import type { CompletionIntent } from '../tree-sitter/query-sdk'
 
+import { isValidTestFile } from '../commands/utils/test-commands'
+import {
+    type GitIdentifiersForFile,
+    gitMetadataForCurrentEditor,
+} from '../repository/git-metadata-for-editor'
+import { GitHubDotComRepoMetadata } from '../repository/githubRepoMetadata'
+import * as CompletionAnalyticsLogger from './analytics-logger'
+import type { CompletionLogID } from './analytics-logger'
 import type { ContextMixer } from './context/context-mixer'
-import { insertIntoDocContext, type DocumentContext } from './get-current-doc-context'
-import * as CompletionLogger from './logger'
-import type { CompletionLogID } from './logger'
+import { insertIntoDocContext } from './get-current-doc-context'
+import { autocompleteOutputChannelLogger } from './output-channel-logger'
 import type {
     CompletionProviderTracer,
+    GenerateCompletionsOptions,
     Provider,
-    ProviderConfig,
-    ProviderOptions,
-} from './providers/provider'
-import type { RequestManager, RequestParams } from './request-manager'
+} from './providers/shared/provider'
+import type { RequestManager, RequestManagerResult, RequestParams } from './request-manager'
 import { reuseLastCandidate } from './reuse-last-candidate'
+import type { SmartThrottleService } from './smart-throttle'
 import type { AutocompleteItem } from './suggested-autocomplete-items-cache'
 import type { InlineCompletionItemWithAnalytics } from './text-processing/process-inline-completions'
 import type { ProvideInlineCompletionsItemTraceData } from './tracer'
-import { isValidTestFile } from '../commands/utils/test-commands'
-import { completionProviderConfig } from './completion-provider-config'
+import { sleep } from './utils'
 
 export interface InlineCompletionsParams {
     // Context
@@ -38,24 +45,25 @@ export interface InlineCompletionsParams {
     docContext: DocumentContext
     completionIntent?: CompletionIntent
     lastAcceptedCompletionItem?: Pick<AutocompleteItem, 'requestParams' | 'analyticsItem'>
-
-    // Prompt parameters
-    providerConfig: ProviderConfig
+    provider: Provider
 
     // Shared
     requestManager: RequestManager
     contextMixer: ContextMixer
+    smartThrottleService: SmartThrottleService | null
+    stageRecorder: CompletionAnalyticsLogger.AutocompleteStageRecorder
 
     // UI state
-    isDotComUser: boolean
     lastCandidate?: LastInlineCompletionCandidate
     debounceInterval?: { singleLine: number; multiLine: number }
     setIsLoading?: (isLoading: boolean) => void
 
     // Execution
     abortSignal?: AbortSignal
+    cancellationListener?: vscode.Disposable
     tracer?: (data: Partial<ProvideInlineCompletionsItemTraceData>) => void
-    artificialDelay?: number
+    firstCompletionTimeout: number
+    numberOfCompletionsToGenerate?: number
 
     // Feature flags
     completeSuggestWidgetSelection?: boolean
@@ -102,10 +110,16 @@ export interface InlineCompletionsResult {
 
     /** The completions. */
     items: InlineCompletionItemWithAnalytics[]
+
+    /**
+     * If the request has become stale.
+     * This will be the case if it is left in-flight but superseded by a newer request.
+     */
+    stale?: boolean
 }
 
 /**
- * The source of the inline completions result.
+ * The source of the inline completions result. Using numerical values so telemetry can be recorded on `metadata`
  */
 export enum InlineCompletionsResultSource {
     Network = 'Network',
@@ -122,7 +136,19 @@ export enum InlineCompletionsResultSource {
      */
     LastCandidate = 'LastCandidate',
 }
-
+/**
+ * Create a mapping of all inline completion sources to numerical values, so telemetry can be recorded on `metadata`.
+ */
+export const InlineCompletionsResultSourceTelemetryMetadataMapping: Record<
+    InlineCompletionsResultSource,
+    number
+> = {
+    [InlineCompletionsResultSource.Network]: 1,
+    [InlineCompletionsResultSource.Cache]: 2,
+    [InlineCompletionsResultSource.HotStreak]: 3,
+    [InlineCompletionsResultSource.CacheAfterRequestStart]: 4,
+    [InlineCompletionsResultSource.LastCandidate]: 5,
+}
 /**
  * Extends the default VS Code trigger kind to distinguish between manually invoking a completion
  * via the keyboard shortcut and invoking a completion via hovering over ghost text.
@@ -139,6 +165,20 @@ export enum TriggerKind {
 
     /** When the user uses the suggest widget to cycle through different completions. */
     SuggestWidget = 'SuggestWidget',
+
+    /** Completion pre-loading was triggered by our heuristics. This completions are not shown to the user. */
+    Preload = 'Preload',
+}
+export const TriggerKindTelemetryMetadataMapping: Record<TriggerKind, number> = {
+    [TriggerKind.Hover]: 1,
+    [TriggerKind.Automatic]: 2,
+    [TriggerKind.Manual]: 3,
+    [TriggerKind.SuggestWidget]: 4,
+    [TriggerKind.Preload]: 5,
+}
+
+export function allTriggerKinds(): TriggerKind[] {
+    return [TriggerKind.Automatic, TriggerKind.Hover, TriggerKind.Manual, TriggerKind.SuggestWidget]
 }
 
 export async function getInlineCompletions(
@@ -152,17 +192,22 @@ export async function getInlineCompletions(
         const error = unknownError instanceof Error ? unknownError : new Error(unknownError as any)
 
         params.tracer?.({ error: error.toString() })
+
+        if (isAbortError(error)) {
+            return null
+        }
+
         if (process.env.NODE_ENV === 'development') {
             // Log errors to the console in the development mode to see the stack traces with source maps
             // in Chrome dev tools.
             console.error(error)
         }
-        logError('getInlineCompletions:error', error.message, error.stack, { verbose: { error } })
-        CompletionLogger.logError(error)
 
-        if (isAbortError(error)) {
-            return null
-        }
+        autocompleteOutputChannelLogger.logError('getInlineCompletions', error.message, error.stack, {
+            verbose: { error },
+        })
+
+        CompletionAnalyticsLogger.logError(error)
 
         throw error
     } finally {
@@ -180,49 +225,43 @@ async function doGetInlineCompletions(
         selectedCompletionInfo,
         docContext,
         docContext: { multilineTrigger, currentLineSuffix, currentLinePrefix },
-        providerConfig,
+        provider,
         contextMixer,
+        smartThrottleService,
         requestManager,
         lastCandidate,
         debounceInterval,
         setIsLoading,
         abortSignal,
+        cancellationListener,
         tracer,
         handleDidAcceptCompletionItem,
         handleDidPartiallyAcceptCompletionItem,
-        artificialDelay,
+        firstCompletionTimeout,
         completionIntent,
         lastAcceptedCompletionItem,
-        isDotComUser,
+        stageRecorder,
+        numberOfCompletionsToGenerate,
     } = params
 
     tracer?.({ params: { document, position, triggerKind, selectedCompletionInfo } })
 
-    // If we have a suffix in the same line as the cursor and the suffix contains any word
-    // characters, do not attempt to make a completion. This means we only make completions if
-    // we have a suffix in the same line for special characters like `)]}` etc.
-    //
-    // VS Code will attempt to merge the remainder of the current line by characters but for
-    // words this will easily get very confusing.
-    if (triggerKind !== TriggerKind.Manual && /\w/.test(currentLineSuffix)) {
-        return null
+    const isDotComUser = isDotComAuthed()
+
+    const gitIdentifiersForFile = isDotComUser
+        ? gitMetadataForCurrentEditor.getGitIdentifiersForFile()
+        : undefined
+    if (gitIdentifiersForFile?.repoName) {
+        const repoMetadataInstance = GitHubDotComRepoMetadata.getInstance()
+        // Calling this so that it precomputes the `gitRepoUrl` and store in its cache for query later.
+        repoMetadataInstance.getRepoMetadataUsingRepoName(gitIdentifiersForFile.repoName).catch(() => {})
     }
 
-    // Do not trigger when the last character is a closing symbol
-    if (triggerKind !== TriggerKind.Manual && /[);\]}]$/.test(currentLinePrefix.trim())) {
-        return null
-    }
-
-    // Do not trigger when cursor is at the start of the file ending line and the line above is empty
     if (
         triggerKind !== TriggerKind.Manual &&
-        position.line !== 0 &&
-        position.line === document.lineCount - 1
+        shouldCancelBasedOnCurrentLine({ position, document, currentLinePrefix, currentLineSuffix })
     ) {
-        const lineAbove = Math.max(position.line - 1, 0)
-        if (document.lineAt(lineAbove).isEmptyOrWhitespace && !position.character) {
-            return null
-        }
+        return null
     }
 
     // Do not trigger when the user just accepted a single-line completion
@@ -236,7 +275,6 @@ async function doGetInlineCompletions(
             docContext: lastAcceptedCompletionItem.requestParams.docContext,
             insertText: lastAcceptedCompletionItem.analyticsItem.insertText,
             languageId: lastAcceptedCompletionItem.requestParams.document.languageId,
-            dynamicMultilineCompletions: false,
         })
         if (
             docContext.prefix === docContextOfLastAcceptedAndInsertedCompletionItem.prefix &&
@@ -246,6 +284,8 @@ async function doGetInlineCompletions(
             return null
         }
     }
+
+    stageRecorder.record('preLastCandidate')
 
     // Check if the user is typing as suggested by the last candidate completion (that is shown as
     // ghost text in the editor), and reuse it if it is still valid.
@@ -261,6 +301,7 @@ async function doGetInlineCompletions(
                   handleDidPartiallyAcceptCompletionItem,
               })
             : null
+
     if (resultToReuse) {
         return resultToReuse
     }
@@ -268,73 +309,24 @@ async function doGetInlineCompletions(
     // Only log a completion as started if it's either served from cache _or_ the debounce interval
     // has passed to ensure we don't log too many start events where we end up not doing any work at
     // all.
-    CompletionLogger.flushActiveSuggestionRequests()
+    if (triggerKind !== TriggerKind.Preload) {
+        CompletionAnalyticsLogger.flushActiveSuggestionRequests(isDotComUser)
+    }
     const multiline = Boolean(multilineTrigger)
-    const logId = CompletionLogger.create({
+    const logId = CompletionAnalyticsLogger.create({
         multiline,
         triggerKind,
-        providerIdentifier: providerConfig.identifier,
-        providerModel: providerConfig.model,
+        providerIdentifier: provider.id,
+        providerModel: provider.legacyModel,
         languageId: document.languageId,
         testFile: isValidTestFile(document.uri),
         completionIntent,
-        artificialDelay,
         traceId: getActiveTraceAndSpanId()?.traceId,
+        stageTimings: stageRecorder.stageTimings,
     })
+    stageRecorder.setLogId(logId)
 
-    // Debounce to avoid firing off too many network requests as the user is still typing.
-    await wrapInActiveSpan('autocomplete.debounce', async () => {
-        const interval =
-            ((multiline ? debounceInterval?.multiLine : debounceInterval?.singleLine) ?? 0) +
-            (artificialDelay ?? 0)
-        if (triggerKind === TriggerKind.Automatic && interval !== undefined && interval > 0) {
-            await new Promise<void>(resolve => setTimeout(resolve, interval))
-        }
-    })
-
-    // We don't need to make a request at all if the signal is already aborted after the debounce.
-    if (abortSignal?.aborted) {
-        return null
-    }
-
-    setIsLoading?.(true)
-    CompletionLogger.start(logId)
-
-    // Fetch context
-    const contextResult = await wrapInActiveSpan('autocomplete.retrieve', async () => {
-        return contextMixer.getContext({
-            document,
-            position,
-            docContext,
-            abortSignal,
-            maxChars: providerConfig.contextSizeHints.totalChars,
-        })
-    })
-    if (abortSignal?.aborted) {
-        return null
-    }
-    tracer?.({ context: contextResult })
-
-    const completionProvider = getCompletionProvider({
-        document,
-        position,
-        triggerKind,
-        providerConfig,
-        docContext,
-    })
-
-    tracer?.({
-        completers: [
-            {
-                ...completionProvider.options,
-                completionIntent,
-            },
-        ],
-    })
-
-    CompletionLogger.networkRequestStarted(logId, contextResult?.logSummary)
-
-    const requestParams: RequestParams = {
+    let requestParams: RequestParams = {
         document,
         docContext,
         position,
@@ -342,62 +334,249 @@ async function doGetInlineCompletions(
         abortSignal,
     }
 
-    // Get the processed completions from providers
-    const { completions, source } = await requestManager.request({
+    stageRecorder.record('preCache')
+    const cachedResult = requestManager.checkCache({
         requestParams,
-        provider: completionProvider,
-        context: contextResult?.context ?? [],
         isCacheEnabled: triggerKind !== TriggerKind.Manual,
+    })
+    if (cachedResult) {
+        const { completions, source, isFuzzyMatch } = cachedResult
+
+        CompletionAnalyticsLogger.start(logId)
+        CompletionAnalyticsLogger.loaded({
+            logId,
+            requestParams,
+            completions,
+            source,
+            isFuzzyMatch,
+            isDotComUser,
+        })
+
+        return {
+            logId,
+            items: completions,
+            source,
+        }
+    }
+
+    // If we have inflight request with the same request params, just use it here instead of doing additional work.
+    // Specifically relevant for completions preloading where we want to avoid doing work twice:
+    // - We have preloaded a line, and then the user triggers a request for the exact same preloaded inflight request.
+    // - We may trigger a 2nd preloaded request if the user moves their cursor to the next empty line.
+    const matchingInflightRequest = requestManager.getMatchingInflightRequest({ requestParams })
+
+    if (matchingInflightRequest) {
+        const result = await matchingInflightRequest.promise
+
+        return processRequestManagerResult({
+            result,
+            logId,
+            gitIdentifiersForFile,
+            requestParams,
+            isDotComUser,
+            stale: false,
+        })
+    }
+
+    /**
+     * A request becomes stale if it is left in-flight but superseded by another request.
+     * This only applies to the smart throttle.
+     */
+    let stale: boolean | undefined
+    const markRequestAsStale = () => {
+        stale = true
+    }
+
+    if (smartThrottleService || triggerKind === TriggerKind.Preload) {
+        // For the smart throttle to work correctly and preserve tail requests, we need full control
+        // over the cancellation logic for each request.
+        // Therefore we must stop listening for cancellation events originating from VS Code.
+        //
+        // And we do not want to cancel preload requests if a user continues typing forward.
+        cancellationListener?.dispose()
+    }
+
+    if (
+        smartThrottleService &&
+        // Do not apply additional throttling to manually triggered suggestions.
+        triggerKind !== TriggerKind.Manual &&
+        /// Do no apply additional throttling to preload requests.
+        triggerKind !== TriggerKind.Preload
+    ) {
+        stageRecorder.record('preSmartThrottle')
+        const throttledRequest = await smartThrottleService.throttle(
+            requestParams,
+            triggerKind,
+            markRequestAsStale
+        )
+        if (throttledRequest === null) {
+            return null
+        }
+
+        requestParams = throttledRequest
+    }
+
+    stageRecorder.record('preDebounce')
+    const debounceTime = smartThrottleService
+        ? 0
+        : triggerKind !== TriggerKind.Automatic
+          ? 0
+          : (multiline ? debounceInterval?.multiLine : debounceInterval?.singleLine) ?? 0
+
+    // We split the desired debounceTime into two chunks. One that is at most 25ms where every
+    // further execution is halted...
+    const waitInterval = Math.min(debounceTime, 25)
+    // ...and one for the remaining time where we can already start retrieving context in parallel.
+    const remainingInterval = debounceTime - waitInterval
+    if (waitInterval > 0) {
+        await wrapInActiveSpan('autocomplete.debounce.wait', () => sleep(waitInterval))
+        if (abortSignal?.aborted) {
+            return null
+        }
+    }
+
+    setIsLoading?.(true)
+    CompletionAnalyticsLogger.start(logId)
+    stageRecorder.record('preContextRetrieval')
+
+    // Fetch context and apply remaining debounce time
+    const [contextResult] = await Promise.all([
+        wrapInActiveSpan('autocomplete.retrieve', () =>
+            contextMixer.getContext({
+                document,
+                position,
+                docContext,
+                abortSignal,
+                maxChars: provider.contextSizeHints.totalChars,
+                lastCandidate,
+                repoName: gitIdentifiersForFile?.repoName,
+            })
+        ),
+        remainingInterval > 0
+            ? wrapInActiveSpan('autocomplete.debounce.remaining', () => sleep(remainingInterval))
+            : null,
+    ])
+
+    if (abortSignal?.aborted) {
+        return null
+    }
+
+    tracer?.({ context: contextResult })
+
+    let gitContext = undefined
+    if (gitIdentifiersForFile?.repoName) {
+        gitContext = {
+            repoName: gitIdentifiersForFile.repoName,
+        }
+    }
+
+    const n = provider.mayUseOnDeviceInference
+        ? 1
+        : // Show more if manually triggered (but only showing 1 is faster, so we use it
+          // in the automatic trigger case).
+          triggerKind === TriggerKind.Automatic || triggerKind === TriggerKind.Preload
+          ? 1
+          : 3
+
+    const generateOptions: GenerateCompletionsOptions = {
+        triggerKind,
+        docContext,
+        document,
+        position,
+        firstCompletionTimeout,
+        completionLogId: logId,
+        gitContext,
+        numberOfCompletionsToGenerate: numberOfCompletionsToGenerate ?? n,
+        multiline: !!docContext.multilineTrigger,
+        snippets: contextResult?.context ?? [],
+    }
+
+    tracer?.({
+        completers: [
+            {
+                ...provider.options,
+                ...generateOptions,
+                completionIntent,
+            },
+        ],
+    })
+
+    CompletionAnalyticsLogger.networkRequestStarted(logId, contextResult?.contextSummary)
+    stageRecorder.record('preNetworkRequest')
+
+    // Get the processed completions from providers
+    const result = await requestManager.request({
+        logId,
+        requestParams,
+        generateOptions,
+        provider,
+        isCacheEnabled: triggerKind !== TriggerKind.Manual,
+        isPreloadRequest: triggerKind === TriggerKind.Preload,
         tracer: tracer ? createCompletionProviderTracer(tracer) : undefined,
     })
 
-    CompletionLogger.loaded(logId, requestParams, completions, source, isDotComUser)
+    return processRequestManagerResult({
+        result,
+        logId,
+        gitIdentifiersForFile,
+        requestParams,
+        isDotComUser,
+        stale,
+        contextLoggingSnippets: contextResult?.contextLoggingSnippets ?? [],
+    })
+}
+
+interface ProcessRequestManagerResultParams {
+    result: RequestManagerResult
+    logId: CompletionLogID
+    gitIdentifiersForFile: GitIdentifiersForFile | undefined
+    requestParams: RequestParams
+    isDotComUser: boolean
+    stale: boolean | undefined
+    contextLoggingSnippets?: AutocompleteContextSnippet[]
+}
+
+function processRequestManagerResult(
+    params: ProcessRequestManagerResultParams
+): Awaited<ReturnType<typeof doGetInlineCompletions>> {
+    const {
+        result: { completions, source, updatedLogId },
+        gitIdentifiersForFile,
+        requestParams,
+        isDotComUser,
+        stale,
+        contextLoggingSnippets,
+    } = params
+
+    let { logId } = params
+
+    if (updatedLogId !== undefined) {
+        // If we have a new `updatedLogId`, we need to use this.
+        // This will usually be because we have determine that we want to re-use an existing result
+        // from the request manager. For example, if a result is recycled for this in-flight request,
+        // we will use the logId of the recycled result, ensuring that we do not have duplicate logging.
+        logId = updatedLogId
+    }
+
+    CompletionAnalyticsLogger.loaded({
+        logId,
+        requestParams,
+        completions,
+        source,
+        isDotComUser,
+        inlineContextParams: {
+            context: contextLoggingSnippets ?? [],
+            ...gitIdentifiersForFile,
+        },
+        isFuzzyMatch: false,
+    })
 
     return {
         logId,
         items: completions,
         source,
+        stale,
     }
-}
-
-interface GetCompletionProvidersParams
-    extends Pick<InlineCompletionsParams, 'document' | 'position' | 'triggerKind' | 'providerConfig'> {
-    docContext: DocumentContext
-}
-
-function getCompletionProvider(params: GetCompletionProvidersParams): Provider {
-    const { document, position, triggerKind, providerConfig, docContext } = params
-
-    const sharedProviderOptions: Omit<ProviderOptions, 'id' | 'n' | 'multiline'> = {
-        docContext,
-        document,
-        position,
-        dynamicMultilineCompletions: completionProviderConfig.dynamicMultilineCompletions,
-        hotStreak: completionProviderConfig.hotStreak,
-        fastPath: completionProviderConfig.fastPath,
-        // For the now the value is static and based on the average multiline completion latency.
-        firstCompletionTimeout: 1900,
-    }
-
-    if (docContext.multilineTrigger) {
-        return providerConfig.create({
-            ...sharedProviderOptions,
-            n: completionProviderConfig.getPrefetchedFlag(
-                FeatureFlag.CodyAutocompleteSingleMultilineRequest
-            )
-                ? 1
-                : 3, // 3 vs. 1 does not meaningfully affect perf
-            multiline: true,
-        })
-    }
-
-    return providerConfig.create({
-        ...sharedProviderOptions,
-        // Show more if manually triggered (but only showing 1 is faster, so we use it
-        // in the automatic trigger case).
-        n: triggerKind === TriggerKind.Automatic ? 1 : 3,
-        multiline: false,
-    })
 }
 
 function createCompletionProviderTracer(
@@ -409,4 +588,41 @@ function createCompletionProviderTracer(
             result: data => tracer({ completionProviderCallResult: data }),
         }
     )
+}
+
+interface ShouldCancelBasedOnCurrentLineParams {
+    currentLinePrefix: string
+    currentLineSuffix: string
+    position: vscode.Position
+    document: vscode.TextDocument
+}
+
+export function shouldCancelBasedOnCurrentLine(params: ShouldCancelBasedOnCurrentLineParams): boolean {
+    const { currentLinePrefix, currentLineSuffix, position, document } = params
+
+    // If we have a suffix in the same line as the cursor and the suffix contains any word
+    // characters, do not attempt to make a completion. This means we only make completions if
+    // we have a suffix in the same line for special characters like `)]}` etc.
+    //
+    // VS Code will attempt to merge the remainder of the current line by characters but for
+    // words this will easily get very confusing.
+    if (/\w/.test(currentLineSuffix)) {
+        return true
+    }
+
+    // Do not trigger when the last character is a closing symbol
+    if (/[);\]}]$/.test(currentLinePrefix.trim())) {
+        return true
+    }
+
+    // Do not trigger when cursor is at the start of the file ending line and the line above is empty
+    if (position.line !== 0 && position.line === document.lineCount - 1) {
+        const lineAbove = Math.max(position.line - 1, 0)
+
+        if (document.lineAt(lineAbove).isEmptyOrWhitespace && !position.character) {
+            return true
+        }
+    }
+
+    return false
 }

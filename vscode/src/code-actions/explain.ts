@@ -1,4 +1,6 @@
+import { PromptString, ps } from '@sourcegraph/cody-shared'
 import * as vscode from 'vscode'
+import type { ExecuteChatArguments } from '../commands/execute/ask'
 
 export class ExplainCodeAction implements vscode.CodeActionProvider {
     public static readonly providedCodeActionKinds = [vscode.CodeActionKind.QuickFix]
@@ -16,23 +18,34 @@ export class ExplainCodeAction implements vscode.CodeActionProvider {
         if (diagnostics.length === 0) {
             return []
         }
-        return [this.createCommandCodeAction(diagnostics)]
+        return [this.createCommandCodeAction(document.uri, diagnostics)]
     }
 
-    private createCommandCodeAction(diagnostics: vscode.Diagnostic[]): vscode.CodeAction {
+    private createCommandCodeAction(
+        uri: vscode.Uri,
+        diagnostics: vscode.Diagnostic[]
+    ): vscode.CodeAction {
         const action = new vscode.CodeAction('Ask Cody to Explain', vscode.CodeActionKind.QuickFix)
-        const instruction = this.getCodeActionInstruction(diagnostics)
+        const instruction = this.getCodeActionInstruction(uri, diagnostics)
         action.command = {
             command: 'cody.action.chat',
-            arguments: [instruction, { source: 'code-action:explain' }],
+            arguments: [
+                {
+                    text: instruction,
+                    source: 'code-action:explain',
+                } satisfies ExecuteChatArguments,
+            ],
             title: 'Ask Cody to Explain',
         }
         action.diagnostics = diagnostics
         return action
     }
 
-    private getCodeActionInstruction = (diagnostics: vscode.Diagnostic[]): string =>
-        `Explain the following error${diagnostics.length > 1 ? 's' : ''}:\n\n${diagnostics
-            .map(({ message }) => `\`\`\`${message}\`\`\``)
-            .join('\n\n')}`
+    private getCodeActionInstruction = (uri: vscode.Uri, diagnostics: vscode.Diagnostic[]) =>
+        ps`Explain the following error${diagnostics.length > 1 ? ps`s` : ''}:\n\n${PromptString.join(
+            diagnostics
+                .map(d => PromptString.fromDiagnostic(uri, d))
+                .map(({ message }) => ps`\`\`\`${message}\`\`\``),
+            ps`\n\n`
+        )}`
 }

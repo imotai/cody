@@ -1,10 +1,19 @@
-import { omit } from 'lodash'
+import omit from 'lodash/omit'
+import pick from 'lodash/pick'
+import { Response } from 'node-fetch'
 import * as uuid from 'uuid'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
+import {
+    AUTH_STATUS_FIXTURE_AUTHED,
+    AUTH_STATUS_FIXTURE_AUTHED_DOTCOM,
+    telemetryRecorder,
+} from '@sourcegraph/cody-shared'
+
+import type { CodeGenEventMetadata } from '../../services/CharactersLogger'
 import { resetParsersCache } from '../../tree-sitter/parser'
-import * as CompletionLogger from '../logger'
-import type { CompletionBookkeepingEvent } from '../logger'
+import * as CompletionAnalyticsLogger from '../analytics-logger'
+import type { CompletionBookkeepingEvent } from '../analytics-logger'
 import { initTreeSitterParser } from '../test-helpers'
 
 import { getInlineCompletions, params } from './helpers'
@@ -22,28 +31,64 @@ describe('[getInlineCompletions] completion event', () => {
         code: string,
         completion: string,
         additionalParams: { isDotComUser?: boolean } = {}
-    ): Promise<Partial<CompletionBookkeepingEvent>> {
+    ): Promise<CompletionBookkeepingEvent> {
         vi.spyOn(uuid, 'v4').mockImplementation(() => 'stable-uuid')
-        const spy = vi.spyOn(CompletionLogger, 'loaded')
+        const spy = vi.spyOn(CompletionAnalyticsLogger, 'loaded')
 
-        await getInlineCompletions(
-            params(
-                code,
-                [
-                    {
+        const response = new Response(code, {
+            status: 200,
+            headers: {
+                'x-cody-resolved-model': 'sourcegraph/gateway-model',
+                'fireworks-speculation-matched-tokens': '100',
+            },
+        })
+
+        const generateParams = params(
+            code,
+            [
+                {
+                    completionResponse: {
                         completion,
                         stopReason: 'unit-test',
                     },
-                ],
-                additionalParams
-            )
+                    metadata: {
+                        response,
+                    },
+                },
+            ],
+            {
+                configuration: {
+                    configuration: {
+                        autocompleteAdvancedProvider: 'fireworks',
+                    },
+                },
+                authStatus: additionalParams.isDotComUser
+                    ? AUTH_STATUS_FIXTURE_AUTHED_DOTCOM
+                    : AUTH_STATUS_FIXTURE_AUTHED,
+            }
         )
+        const completionResponse = await getInlineCompletions(generateParams)
 
-        // Get `suggestionId` from `CompletionLogger.loaded` call.
-        const suggestionId: CompletionLogger.CompletionLogID = spy.mock.calls[0][0]
-        const completionEvent = CompletionLogger.getCompletionEvent(suggestionId)
+        // Get `suggestionId` from `CompletionAnalyticsLogger.loaded` call.
+        const suggestionId: CompletionAnalyticsLogger.CompletionLogID = spy.mock.calls[0][0].logId
+        const completionEvent = CompletionAnalyticsLogger.getCompletionEvent(suggestionId)!
 
-        return omit(completionEvent, [
+        CompletionAnalyticsLogger.accepted({
+            id: suggestionId,
+            document: generateParams.document,
+            completion: completionResponse!.items[0],
+            trackedRange: undefined,
+            isDotComUser: true,
+            position: generateParams.position,
+        })
+
+        return completionEvent
+    }
+
+    function eventWithoutTimestamps(
+        event: CompletionBookkeepingEvent
+    ): Partial<CompletionBookkeepingEvent> {
+        return omit(event, [
             'acceptedAt',
             'loadedAt',
             'networkRequestStartedAt',
@@ -53,17 +98,28 @@ describe('[getInlineCompletions] completion event', () => {
             'suggestionAnalyticsLoggedAt',
             'suggestionLoggedAt',
             'params.contextSummary.duration',
+            'params.stageTimings',
         ])
     }
 
-    describe('fills all the expected fields on `CompletionLogger.loaded` calls', () => {
+    describe('fills all the expected fields on `CompletionAnalyticsLogger.loaded` calls', () => {
         it('for multiLine completions', async () => {
-            const eventWithoutTimestamps = await getAnalyticsEvent(
+            const event = await getAnalyticsEvent(
                 'function foo() {█}',
                 'console.log(bar)\nreturn false}'
             )
 
-            expect(eventWithoutTimestamps).toMatchInlineSnapshot(`
+            expect(Object.keys(event.params.stageTimings)).toMatchInlineSnapshot(`
+              [
+                "preLastCandidate",
+                "preCache",
+                "preDebounce",
+                "preContextRetrieval",
+                "preNetworkRequest",
+              ]
+            `)
+
+            expect(eventWithoutTimestamps(event)).toMatchInlineSnapshot(`
               {
                 "id": "stable-uuid",
                 "items": [
@@ -86,41 +142,55 @@ describe('[getInlineCompletions] completion event', () => {
                       "parent": "statement_block",
                     },
                     "parseErrorCount": 0,
-                    "stopReason": "unit-test",
+                    "stopReason": undefined,
                     "truncatedWith": "tree-sitter",
                   },
                 ],
                 "loggedPartialAcceptedLength": 0,
                 "params": {
-                  "artificialDelay": undefined,
                   "completionIntent": "function.body",
                   "contextSummary": {
+                    "prefixChars": 16,
                     "retrieverStats": {},
                     "strategy": "none",
-                    "totalChars": 0,
+                    "suffixChars": 1,
+                    "totalChars": 17,
                   },
                   "id": "stable-uuid",
+                  "isFuzzyMatch": false,
                   "languageId": "typescript",
                   "multiline": true,
                   "multilineMode": "block",
-                  "providerIdentifier": "anthropic",
-                  "providerModel": "claude-instant-1.2",
+                  "providerIdentifier": "fireworks",
+                  "providerModel": "starcoder-hybrid",
+                  "resolvedModel": "sourcegraph/gateway-model",
+                  "responseHeaders": {
+                    "fireworks-speculation-matched-tokens": "100",
+                  },
                   "source": "Network",
                   "testFile": false,
                   "traceId": undefined,
                   "triggerKind": "Automatic",
                 },
+                "read": false,
               }
             `)
         })
 
         it('for singleline completions', async () => {
-            const eventWithoutTimestamps = await getAnalyticsEvent(
-                'function foo() {\n  return█}',
-                '"foo"'
-            )
+            const event = await getAnalyticsEvent('function foo() {\n  return█}', '"foo"')
 
-            expect(eventWithoutTimestamps).toMatchInlineSnapshot(`
+            expect(Object.keys(event.params.stageTimings)).toMatchInlineSnapshot(`
+              [
+                "preLastCandidate",
+                "preCache",
+                "preDebounce",
+                "preContextRetrieval",
+                "preNetworkRequest",
+              ]
+            `)
+
+            expect(eventWithoutTimestamps(event)).toMatchInlineSnapshot(`
               {
                 "id": "stable-uuid",
                 "items": [
@@ -143,53 +213,95 @@ describe('[getInlineCompletions] completion event', () => {
                       "parent": "return_statement",
                     },
                     "parseErrorCount": 0,
-                    "stopReason": "unit-test",
+                    "stopReason": undefined,
                     "truncatedWith": undefined,
                   },
                 ],
                 "loggedPartialAcceptedLength": 0,
                 "params": {
-                  "artificialDelay": undefined,
                   "completionIntent": "return_statement",
                   "contextSummary": {
+                    "prefixChars": 25,
                     "retrieverStats": {},
                     "strategy": "none",
-                    "totalChars": 0,
+                    "suffixChars": 1,
+                    "totalChars": 26,
                   },
                   "id": "stable-uuid",
+                  "isFuzzyMatch": false,
                   "languageId": "typescript",
                   "multiline": false,
                   "multilineMode": null,
-                  "providerIdentifier": "anthropic",
-                  "providerModel": "claude-instant-1.2",
+                  "providerIdentifier": "fireworks",
+                  "providerModel": "starcoder-hybrid",
+                  "resolvedModel": "sourcegraph/gateway-model",
+                  "responseHeaders": {
+                    "fireworks-speculation-matched-tokens": "100",
+                  },
                   "source": "Network",
                   "testFile": false,
                   "traceId": undefined,
                   "triggerKind": "Automatic",
                 },
+                "read": false,
               }
             `)
         })
 
-        it('logs `insertText` only for DotCom users', async () => {
-            const eventWithoutTimestamps = await getAnalyticsEvent(
-                'function foo() {\n  return█}',
-                '"foo"'
-            )
+        it('does not log `insertText` for enterprise users', async () => {
+            const event = await getAnalyticsEvent('function foo() {\n  return█}', '"foo"')
 
-            expect(eventWithoutTimestamps.items?.some(item => item.insertText)).toBe(false)
+            expect(event.items?.some(item => item.insertText)).toBe(false)
         })
 
-        it('does not log `insertText` for enterprise users', async () => {
-            const eventWithoutTimestamps = await getAnalyticsEvent(
-                'function foo() {\n  return█}',
-                '"foo"',
-                {
-                    isDotComUser: true,
-                }
-            )
+        it('logs `insertText` only for DotCom users', async () => {
+            const event = await getAnalyticsEvent('function foo() {\n  return█}', '"foo"', {
+                isDotComUser: true,
+            })
 
-            expect(eventWithoutTimestamps.items?.some(item => item.insertText)).toBe(true)
+            expect(event.items?.some(item => item.insertText)).toBe(true)
+        })
+        it('does not log `inlineCompletionItemContext` for enterprise users', async () => {
+            const event = await getAnalyticsEvent('function foo() {\n  return█}', '"foo"')
+            expect(event.params?.inlineCompletionItemContext).toBeUndefined()
+        })
+    })
+
+    describe('fills all the expected fields on `CompletionAnalyticsLogger.accepted` call', async () => {
+        it('add character logger metadata to `accepted` events', async () => {
+            const recordEventSpy = vi.spyOn(telemetryRecorder, 'recordEvent')
+
+            await getAnalyticsEvent('function foo() {\n  return█}', '"foo"')
+
+            const [feature, action, event] = recordEventSpy.mock.calls.find(
+                callArguments => callArguments[1] === 'accepted'
+            )! as [string, string, Record<string, unknown>]
+
+            expect(feature).toBe('cody.completion')
+            expect(action).toBe('accepted')
+            expect(event.metadata).toMatchObject({})
+
+            const characterLoggerMetadata = pick(event.metadata, [
+                'isDisjoint',
+                'isFullyOutsideOfVisibleRanges',
+                'isPartiallyOutsideOfVisibleRanges',
+                'isSelectionStale',
+                'noActiveTextEditor',
+                'outsideOfActiveEditor',
+                'windowNotFocused',
+            ] satisfies (keyof CodeGenEventMetadata)[])
+
+            expect(characterLoggerMetadata).toMatchInlineSnapshot(`
+              {
+                "isDisjoint": 0,
+                "isFullyOutsideOfVisibleRanges": 1,
+                "isPartiallyOutsideOfVisibleRanges": 1,
+                "isSelectionStale": 1,
+                "noActiveTextEditor": 0,
+                "outsideOfActiveEditor": 1,
+                "windowNotFocused": 1,
+              }
+            `)
         })
     })
 })

@@ -1,5 +1,5 @@
-import { statSync } from 'fs'
-import { resolve } from 'path'
+import { statSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 import { defineProjectWithDefaults } from '../.config/viteShared'
 
@@ -21,5 +21,10 @@ function shimDirectory(): string {
 export default defineProjectWithDefaults(__dirname, {
     resolve: {
         alias: { vscode: shimDirectory() },
+    },
+    test: {
+        env: {
+            CODY_SHIM_TESTING: 'true',
+        },
     },
 })

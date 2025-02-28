@@ -1,12 +1,12 @@
 import dedent from 'dedent'
-import { pick } from 'lodash'
+import pick from 'lodash/pick'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { range } from '../../testutils/textDocument'
 import { resetParsersCache } from '../../tree-sitter/parser'
 import { completion, initTreeSitterParser } from '../test-helpers'
 
-import { getInlineCompletions, getInlineCompletionsInsertText, params, T } from './helpers'
+import { T, getInlineCompletions, getInlineCompletionsInsertText, params } from './helpers'
 
 const cases = [true, false]
 
@@ -82,7 +82,10 @@ for (const isTreeSitterEnabled of cases) {
                         completion`
                         ├console.log('foo')┤
                     `,
-                    ]
+                    ],
+                    {
+                        numberOfCompletionsToGenerate: 3,
+                    }
                 )
             )
 
@@ -175,7 +178,10 @@ for (const isTreeSitterEnabled of cases) {
                         completions.map(completion => ({
                             completion,
                             stopReason: 'unknown',
-                        }))
+                        })),
+                        {
+                            numberOfCompletionsToGenerate: 3,
+                        }
                     )
                 )
 
@@ -189,7 +195,7 @@ for (const isTreeSitterEnabled of cases) {
             it('adds parse info to single-line completions', async () => {
                 const completions = await getCompletionItems('function sort(█', [
                     'array) {}',
-                    'array) new',
+                    'array new',
                 ])
 
                 expect(completions.map(c => Boolean(c.parseErrorCount))).toEqual([false, true])
@@ -198,7 +204,7 @@ for (const isTreeSitterEnabled of cases) {
             it('respects completion insert ranges', async () => {
                 const completions = await getCompletionItems('function sort(█)', [
                     'array) {}',
-                    'array) new',
+                    'array new',
                 ])
 
                 expect(completions.map(c => Boolean(c.parseErrorCount))).toEqual([false, true])
@@ -215,37 +221,31 @@ for (const isTreeSitterEnabled of cases) {
                     `,
                     ['array) {\nreturn array.sort()\n} function two() {}', 'array) new\n']
                 )
+                const [completion] = completions.map(c =>
+                    pick(c, ['insertText', 'nodeTypes', 'nodeTypesWithCompletion', 'parseErrorCount'])
+                )
 
-                expect(
-                    completions.map(c =>
-                        pick(c, [
-                            'insertText',
-                            'nodeTypes',
-                            'nodeTypesWithCompletion',
-                            'parseErrorCount',
-                        ])
-                    )
-                ).toMatchInlineSnapshot(`
-                  [
-                    {
-                      "insertText": "array) {",
-                      "nodeTypes": {
-                        "atCursor": "(",
-                        "grandparent": "function_signature",
-                        "greatGrandparent": "program",
-                        "lastAncestorOnTheSameLine": "function_signature",
-                        "parent": "formal_parameters",
-                      },
-                      "nodeTypesWithCompletion": {
-                        "atCursor": "(",
-                        "grandparent": "function_declaration",
-                        "greatGrandparent": "program",
-                        "lastAncestorOnTheSameLine": "function_declaration",
-                        "parent": "formal_parameters",
-                      },
-                      "parseErrorCount": 0,
+                expect(completion).toMatchInlineSnapshot(`
+                  {
+                    "insertText": "array) {
+                  return array.sort()
+                  }",
+                    "nodeTypes": {
+                      "atCursor": "(",
+                      "grandparent": "function_signature",
+                      "greatGrandparent": "program",
+                      "lastAncestorOnTheSameLine": "program",
+                      "parent": "formal_parameters",
                     },
-                  ]
+                    "nodeTypesWithCompletion": {
+                      "atCursor": "(",
+                      "grandparent": "function_declaration",
+                      "greatGrandparent": "program",
+                      "lastAncestorOnTheSameLine": "function_declaration",
+                      "parent": "formal_parameters",
+                    },
+                    "parseErrorCount": 0,
+                  }
                 `)
             })
 

@@ -1,31 +1,55 @@
 import {
     TelemetryRecorderProvider as BaseTelemetryRecorderProvider,
-    defaultEventRecordingOptions,
     NoOpTelemetryExporter,
-    TimestampTelemetryProcessor,
     type TelemetryEventInput,
+    type TelemetryExporter,
     type TelemetryProcessor,
     TestTelemetryExporter,
+    defaultEventRecordingOptions,
 } from '@sourcegraph/telemetry'
+import { TimestampTelemetryProcessor } from '@sourcegraph/telemetry/dist/processors/timestamp'
 
-import {
-    CONTEXT_SELECTION_ID,
-    type Configuration,
-    type ConfigurationWithAccessToken,
-} from '../configuration'
-import { SourcegraphGraphQLAPIClient } from '../sourcegraph-api/graphql'
-import type { LogEventMode } from '../sourcegraph-api/graphql/client'
+import type { CodyIDE } from '../configuration'
 import { GraphQLTelemetryExporter } from '../sourcegraph-api/telemetry/GraphQLTelemetryExporter'
 import { MockServerTelemetryExporter } from '../sourcegraph-api/telemetry/MockServerTelemetryExporter'
 
 import type { BillingCategory, BillingProduct } from '.'
+import { currentAuthStatusOrNotReadyYet } from '../auth/authStatus'
+import type { AuthStatus } from '../auth/types'
+import { clientCapabilities } from '../configuration/clientCapabilities'
+import type { PickResolvedConfiguration } from '../configuration/resolver'
+import {
+    type UserProductSubscription,
+    cachedUserProductSubscription,
+} from '../sourcegraph-api/userProductSubscription'
+import { getTier } from './cody-tier'
 
-interface ExtensionDetails {
-    ide: 'VSCode' | 'JetBrains' | 'Neovim' | 'Emacs'
-    ideExtensionType: 'Cody' | 'CodeSearch'
+export interface ExtensionDetails {
+    ide: CodyIDE
+
+    /**
+     * Platform name, possible values 'linux', 'macos', 'windows',
+     * (see vscode os.ts for Platform enum)
+     */
+    platform: string
 
     /** Version number for the extension. */
     version: string
+
+    /**
+     * If this is provided event recorder will use this name as a client name
+     * in telemetry events, primary is used for having different client name for
+     * CodyWeb in dotcom/enterprise instances.
+     *
+     * If it isn't provided we will fall back on ide+ideExtensionType client name
+     */
+    telemetryClientName: string | undefined
+
+    /**
+     * Architecture name, possible values 'arm64', 'aarch64', 'x86_64', 'x64', 'x86'
+     * (see vscode os.ts for Arch enum)
+     */
+    arch?: string
 }
 
 /**
@@ -39,34 +63,70 @@ export class TelemetryRecorderProvider extends BaseTelemetryRecorderProvider<
     BillingCategory
 > {
     constructor(
-        extensionDetails: ExtensionDetails,
-        config: ConfigurationWithAccessToken,
-        anonymousUserID: string,
-        legacyBackcompatLogEventMode: LogEventMode
+        config: PickResolvedConfiguration<{
+            configuration: true
+            auth: true
+            clientState: 'anonymousUserID'
+        }>
     ) {
-        const client = new SourcegraphGraphQLAPIClient(config)
+        const cap = clientCapabilities()
+        const clientName = cap.telemetryClientName || `${cap.agentIDE}.Cody`
+
         super(
             {
-                client: `${extensionDetails.ide || 'unknown'}${
-                    extensionDetails.ideExtensionType ? `.${extensionDetails.ideExtensionType}` : ''
-                }`,
-                clientVersion: extensionDetails.version,
+                client: clientName,
+                clientVersion: cap.agentExtensionVersion,
             },
             process.env.CODY_TELEMETRY_EXPORTER === 'testing'
-                ? new TestTelemetryExporter()
-                : new GraphQLTelemetryExporter(client, anonymousUserID, legacyBackcompatLogEventMode),
+                ? TESTING_TELEMETRY_EXPORTER.withAnonymousUserID(config.clientState.anonymousUserID)
+                : new GraphQLTelemetryExporter(),
             [
-                new ConfigurationMetadataProcessor(config),
+                new ConfigurationMetadataProcessor(),
                 // Generate timestamps when recording events, instead of serverside
                 new TimestampTelemetryProcessor(),
             ],
             {
                 ...defaultEventRecordingOptions,
-                bufferTimeMs: 0, // disable buffering for now
+                bufferTimeMs: 0, // disable buffering for now. If this is enabled tests might need to be updated to be able to handle the delay between an action and the telemetry being fired.
             }
         )
     }
 }
+
+// This is a special type that is only used in testing to allow for access to anonymousUserID
+type TestTelemetryEventInput = TelemetryEventInput & { testOnlyAnonymousUserID: string | null }
+
+// creating a delegate to the TESTING_TELEMETRY_EXPORTER to allow for easy access to exported events.
+// This instance must be shared for a consistent view of what has been exported.
+class DelegateTelemetryExporter implements TelemetryExporter {
+    private exportedEvents: TestTelemetryEventInput[] = []
+    private anonymousUserID: string | null = null
+
+    constructor(public delegate: TestTelemetryExporter) {}
+    async exportEvents(events: TelemetryEventInput[]): Promise<void> {
+        this.exportedEvents.push(
+            ...events.map(event => ({
+                ...event,
+                testOnlyAnonymousUserID: this.anonymousUserID,
+            }))
+        )
+        await this.delegate.exportEvents(events)
+    }
+
+    withAnonymousUserID(anonymousUserID: string | null): DelegateTelemetryExporter {
+        this.anonymousUserID = anonymousUserID
+        return this
+    }
+
+    getExported(): TestTelemetryEventInput[] {
+        return [...this.exportedEvents]
+    }
+
+    reset(): void {
+        this.exportedEvents = []
+    }
+}
+export const TESTING_TELEMETRY_EXPORTER = new DelegateTelemetryExporter(new TestTelemetryExporter())
 
 /**
  * TelemetryRecorder is the type of recorders returned by
@@ -85,8 +145,10 @@ export class NoOpTelemetryRecorderProvider extends BaseTelemetryRecorderProvider
         super({ client: '' }, new NoOpTelemetryExporter(), processors || [])
     }
 }
-
-const noOpTelemetryRecorder = new NoOpTelemetryRecorderProvider().getRecorder()
+/**
+ * noOpTelemetryRecorder should ONLY be used in tests - it discards all recorded events and does nothing with them.
+ */
+export const noOpTelemetryRecorder = new NoOpTelemetryRecorderProvider().getRecorder()
 
 /**
  * MockServerTelemetryRecorderProvider uses MockServerTelemetryExporter to export
@@ -97,17 +159,16 @@ export class MockServerTelemetryRecorderProvider extends BaseTelemetryRecorderPr
     BillingCategory
 > {
     constructor(
-        extensionDetails: ExtensionDetails,
-        config: ConfigurationWithAccessToken,
-        anonymousUserID: string
+        config: PickResolvedConfiguration<{ configuration: true; clientState: 'anonymousUserID' }>
     ) {
+        const cap = clientCapabilities()
         super(
             {
-                client: `${extensionDetails.ide}.${extensionDetails.ideExtensionType}`,
-                clientVersion: extensionDetails.version,
+                client: `${cap.agentIDE}.Cody`,
+                clientVersion: cap.agentExtensionVersion,
             },
-            new MockServerTelemetryExporter(anonymousUserID),
-            [new ConfigurationMetadataProcessor(config)]
+            new MockServerTelemetryExporter(config.clientState.anonymousUserID),
+            [new ConfigurationMetadataProcessor()]
         )
     }
 }
@@ -117,21 +178,24 @@ export class MockServerTelemetryRecorderProvider extends BaseTelemetryRecorderPr
  * automatically attached to all events.
  */
 class ConfigurationMetadataProcessor implements TelemetryProcessor {
-    constructor(private config: Configuration) {}
-
     public processEvent(event: TelemetryEventInput): void {
         if (!event.parameters.metadata) {
             event.parameters.metadata = []
         }
-        event.parameters.metadata.push(
-            {
-                key: 'contextSelection',
-                value: CONTEXT_SELECTION_ID[this.config.useContext],
-            },
-            {
-                key: 'guardrails',
-                value: this.config.experimentalGuardrails ? 1 : 0,
-            }
-        )
+
+        // The tier is not known yet when the user is not authed, and
+        // `this.authStatusProvider.status` will throw, so omit it.
+        let authStatus: AuthStatus | undefined
+        let sub: UserProductSubscription | null = null
+        try {
+            authStatus = currentAuthStatusOrNotReadyYet()
+            sub = cachedUserProductSubscription()
+        } catch {}
+        if (authStatus) {
+            event.parameters.metadata.push({
+                key: 'tier',
+                value: getTier(authStatus, sub),
+            })
+        }
     }
 }
