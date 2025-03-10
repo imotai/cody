@@ -18,7 +18,7 @@
     "rootDir": "."
   },
   "include": [".config/*.ts"],
-  "exclude": ["dist", "node_modules"],
+  "exclude": ["dist", "node_modules", "typehacks", ".test"],
   "watchOptions": {
     "watchFile": "useFsEvents",
     "watchDirectory": "useFsEvents",
@@ -27,9 +27,10 @@
   "references": [
     { "path": "agent" },
     { "path": "lib/shared" },
-    { "path": "lib/ui" },
+    { "path": "lib/prompt-editor" },
     { "path": "vscode" },
     { "path": "vscode/test/integration" },
-    { "path": "vscode/scripts" }
+    { "path": "vscode/scripts" },
+    { "path": "web" }
   ]
 }

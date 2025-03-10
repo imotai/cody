@@ -1,28 +1,29 @@
-import type { CodyCommand, ContextFile } from '@sourcegraph/cody-shared'
+import {
+    type CodyCommand,
+    type ContextItem,
+    clientCapabilities,
+    isFileURI,
+} from '@sourcegraph/cody-shared'
 
 import * as vscode from 'vscode'
-import { ASK_QUESTION_COMMAND, EDIT_COMMAND } from '../menus/items'
-import { CustomCommandsManager } from './custom-commands'
+import { CodyCommandMenuItems } from '..'
+import { executeExplainHistoryCommand } from '../execute/explain-history'
 import { showCommandMenu } from '../menus'
-import { getContextFileFromShell } from '../context/shell'
-import { getDefaultCommandsMap } from '../utils/get-commands'
+import type { CodyCommandArgs } from '../types'
+import { CustomCommandsManager, openCustomCommandDocsLink } from './custom-commands'
 
-const editorCommands: CodyCommand[] = [
-    {
-        description: ASK_QUESTION_COMMAND.description,
-        prompt: ASK_QUESTION_COMMAND.slashCommand,
-        slashCommand: ASK_QUESTION_COMMAND.slashCommand,
-        mode: 'ask',
-    },
-    {
-        description: EDIT_COMMAND.description,
-        prompt: EDIT_COMMAND.slashCommand,
-        slashCommand: EDIT_COMMAND.slashCommand,
-        mode: 'edit',
-    },
-]
-
-export const vscodeDefaultCommands = getDefaultCommandsMap(editorCommands)
+const vscodeDefaultCommands: CodyCommand[] = CodyCommandMenuItems.filter(
+    ({ isBuiltin }) => isBuiltin === true
+).map(
+    c =>
+        ({
+            key: c.key,
+            description: c.description,
+            prompt: c.prompt ?? '',
+            type: c.isBuiltin ? 'default' : 'experimental',
+            mode: c.mode,
+        }) satisfies CodyCommand
+)
 
 /**
  * Provides management and interaction capabilities for both default and custom Cody commands.
@@ -32,70 +33,102 @@ export const vscodeDefaultCommands = getDefaultCommandsMap(editorCommands)
  */
 export class CommandsProvider implements vscode.Disposable {
     private disposables: vscode.Disposable[] = []
-    protected readonly defaultCommands = vscodeDefaultCommands
-    protected customCommandsStore = new CustomCommandsManager()
-
-    // The commands grouped with default commands and custom commands
-    private allCommands = new Map<string, CodyCommand>()
+    protected readonly commands = new Map<string, CodyCommand>()
+    protected customCommandsStore: CustomCommandsManager | undefined
 
     constructor() {
-        this.disposables.push(this.customCommandsStore)
-        // adds the default commands to the all commands map
-        this.groupCommands(this.defaultCommands)
+        if (!clientCapabilities().isCodyWeb) {
+            for (const c of vscodeDefaultCommands) {
+                this.commands.set(c.key, c)
+            }
+        }
+
+        // Only initialize custom commands store in VS Code.
+        if (clientCapabilities().isVSCode) {
+            this.customCommandsStoreInit()
+        }
 
         // Cody Command Menus
         this.disposables.push(
-            vscode.commands.registerCommand('cody.menu.commands', () => this?.menu('default')),
-            vscode.commands.registerCommand('cody.menu.custom-commands', () => this?.menu('custom')),
-            vscode.commands.registerCommand('cody.menu.commands-settings', () => this?.menu('config'))
+            vscode.commands.registerCommand('cody.menu.commands', a => this?.menu('default', a)),
+            vscode.commands.registerCommand('cody.menu.custom-commands', a => this?.menu('custom', a)),
+            vscode.commands.registerCommand('cody.menu.commands-settings', a => this?.menu('config', a)),
+            vscode.commands.registerCommand('cody.commands.open.doc', () => openCustomCommandDocsLink())
         )
 
-        this.customCommandsStore.init()
+        this.disposables.push(
+            vscode.commands.registerCommand('cody.command.explain-history', a =>
+                executeExplainHistoryCommand(this, a)
+            )
+        )
     }
 
-    private async menu(type: 'custom' | 'config' | 'default'): Promise<void> {
-        const customCommands = await this.getCustomCommands()
-        const commandArray = [...customCommands].map(command => command[1])
-        await showCommandMenu(type, commandArray)
+    public customCommandsStoreInit(): void {
+        this.customCommandsStore = new CustomCommandsManager()
+        this.disposables.push(this.customCommandsStore)
+        this.customCommandsStore.init()
+        void this.customCommandsStore.refresh()
+    }
+
+    private async menu(type: 'custom' | 'config' | 'default', args?: CodyCommandArgs): Promise<void> {
+        const customCommands = [...(this.customCommandsStore?.commands.values() ?? [])]
+        // Display the configuration menu if there is no custom command.
+        if (type === 'custom' && !customCommands.length) {
+            return showCommandMenu('config', customCommands, args)
+        }
+        await showCommandMenu(type, customCommands, args)
+    }
+
+    /**
+     * A list of all available commands.
+     */
+    public list(): CodyCommand[] {
+        return [...(this.customCommandsStore?.commands.values() ?? []), ...this.commands.values()]
     }
 
     /**
      * Find a command by its id
      */
     public get(id: string): CodyCommand | undefined {
-        return this.allCommands.get(id)
-    }
-
-    protected async getCustomCommands(): Promise<Map<string, CodyCommand>> {
-        const { commands } = await this.customCommandsStore.refresh()
-        this.groupCommands(commands)
-        return commands
-    }
-
-    /**
-     * Group the default commands with the custom commands and add a separator
-     */
-    protected groupCommands(customCommands = new Map<string, CodyCommand>()): void {
-        const defaultCommands = [...this.defaultCommands]
-        const combinedMap = new Map([...defaultCommands])
-        // Add the custom commands to the all commands map
-        this.allCommands = new Map([...customCommands, ...combinedMap].sort())
-    }
-
-    /**
-     * Refresh the custom commands from store before combining with default commands
-     */
-    protected async refresh(): Promise<void> {
-        const { commands } = await this.customCommandsStore.refresh()
-        this.groupCommands(commands)
+        return this.commands.get(id) ?? this.customCommandsStore?.commands.get(id)
     }
 
     /**
      * Gets the context file content from executing a shell command.
      * Used for retreiving context for the command field in custom command
      */
-    public async runShell(shell: string): Promise<ContextFile[]> {
+    public async runShell(shell: string): Promise<ContextItem[]> {
+        const { getContextFileFromShell } = await import('../context/shell')
         return getContextFileFromShell(shell)
+    }
+
+    /**
+     * History returns the context for how a file changed. Locally this is
+     * implemented as git log.
+     */
+    public async history(
+        uri: vscode.Uri,
+        options: {
+            /**
+             * Uses git log's -L:<funcname>:<file> traces the evolution of the
+             * function name regex <funcname>, within the <file>. This relies on
+             * reasonable heuristics built into git to find function bodies.
+             * However, the heuristics often fail so we should switch to computing
+             * the line region ourselves.
+             * https://git-scm.com/docs/git-log#Documentation/git-log.txt--Lltfuncnamegtltfilegt
+             */
+            funcname: string
+            /**
+             * Limit the amount of commits to maxCount.
+             */
+            maxCount: number
+        }
+    ): Promise<ContextItem[]> {
+        if (!isFileURI(uri)) {
+            throw new Error('history only supported on local file paths')
+        }
+        const { getContextFileFromGitLog } = await import('../context/git-log')
+        return getContextFileFromGitLog(uri, options)
     }
 
     public dispose(): void {

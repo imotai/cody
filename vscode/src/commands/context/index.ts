@@ -1,14 +1,14 @@
 import * as vscode from 'vscode'
 
-import { isCodyIgnoredFile, type CodyCommandContext, type ContextFile } from '@sourcegraph/cody-shared'
+import type { CodyCommandContext, ContextItem } from '@sourcegraph/cody-shared'
 
-import { logDebug } from '../../log'
-import { getContextFileFromCursor } from './selection'
-import { getContextFileFromCurrentFile } from './current-file'
-import { getContextFileFromUri } from './file-path'
-import { getContextFileFromDirectory } from './directory'
-import { getContextFileFromTabs } from './open-tabs'
 import { Utils } from 'vscode-uri'
+import { logDebug } from '../../output-channel-logger'
+import { getContextFileFromCurrentFile } from './current-file'
+import { getContextFileFromDirectory } from './directory'
+import { getContextFileFromUri } from './file-path'
+import { getContextFileFromTabs } from './open-tabs'
+import { getContextFileFromCursor } from './selection'
 
 /**
  * Gets the context files for a Cody command based on the given configuration.
@@ -20,9 +20,9 @@ import { Utils } from 'vscode-uri'
  *
  * The returned context files are filtered to remove any files ignored by Cody.
  */
-export const getCommandContextFiles = async (config: CodyCommandContext): Promise<ContextFile[]> => {
+export const getCommandContextFiles = async (config: CodyCommandContext): Promise<ContextItem[]> => {
     try {
-        const contextFiles: ContextFile[] = []
+        const contextFiles: ContextItem[] = []
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri
 
         // Return immediately if context.none is true
@@ -31,17 +31,26 @@ export const getCommandContextFiles = async (config: CodyCommandContext): Promis
         }
 
         if (config.selection !== false) {
-            contextFiles.push(...(await getContextFileFromCursor()))
+            const item = await getContextFileFromCursor()
+            if (item) {
+                contextFiles.push(item)
+            }
         }
 
         if (config.currentFile) {
-            contextFiles.push(...(await getContextFileFromCurrentFile()))
+            const item = await getContextFileFromCurrentFile()
+            if (item) {
+                contextFiles.push(item)
+            }
         }
 
         if (config.filePath && workspaceRoot?.path) {
             // Create an workspace uri with the given relative file path
             const file = Utils.joinPath(workspaceRoot, config.filePath)
-            contextFiles.push(...(await getContextFileFromUri(file)))
+            const item = await getContextFileFromUri(file)
+            if (item) {
+                contextFiles.push(item)
+            }
         }
 
         if (config.directoryPath && workspaceRoot?.path) {
@@ -59,7 +68,7 @@ export const getCommandContextFiles = async (config: CodyCommandContext): Promis
             contextFiles.push(...(await getContextFileFromTabs()))
         }
 
-        return contextFiles.filter(file => !isCodyIgnoredFile(file.uri))
+        return contextFiles
     } catch (error) {
         logDebug('getCommandContextFiles', 'Error getting command context files', error)
         return []

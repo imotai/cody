@@ -1,10 +1,11 @@
-import { execSync } from 'child_process'
-import path from 'path'
+import { execSync } from 'node:child_process'
+import path from 'node:path'
+import jsonStableStringify from 'fast-json-stable-stringify'
 
-import { Polly, type EXPIRY_STRATEGY, type MODE } from '@pollyjs/core'
+import { type EXPIRY_STRATEGY, type Headers, type MODE, Polly, type PollyConfig } from '@pollyjs/core'
 
 import { CodyNodeHttpAdapter } from './CodyNodeHttpAdapter'
-import { CodyPersister, redactAccessToken } from './CodyPersister'
+import { CodyPersister, redactAuthorizationHeader } from './CodyPersister'
 
 interface PollyOptions {
     recordingName: string
@@ -24,8 +25,8 @@ export function startPollyRecording(userOptions: PollyOptions): Polly {
         flushRequestsOnStop: true,
         recordIfMissing: options.recordIfMissing ?? options.recordingMode === 'record',
         mode: options.recordingMode,
-        adapters: ['node-http'],
-        persister: 'cody-fs',
+        adapters: [CodyNodeHttpAdapter],
+        persister: CodyPersister,
         recordFailedRequests: true,
         expiryStrategy: options.recordingExpiryStrategy,
         expiresIn: options.expiresIn,
@@ -35,42 +36,52 @@ export function startPollyRecording(userOptions: PollyOptions): Polly {
                 recordingsDir: options.recordingDirectory,
             },
         },
-        matchRequestsBy: {
-            order: false,
-
-            // The logic below is a bit tricky to follow. Simplified, we need to
-            // ensure that Polly generates the same request ID regardless if
-            // we're running in record mode (with an access token) or in replay
-            // mode (with a redacted token). The ID is computed by Polly as the
-            // MD5 digest of all request "identifiers", which a JSON object that
-            // includes a "headers" property from the result of the function
-            // below. To better understand what's going on, it's helpful to read
-            // the implementation of Polly here:
-            //   https://sourcegraph.com/github.com/Netflix/pollyjs@9b6bede12b7ee998472b8883c9dd01e2159e00a8/-/blob/packages/@pollyjs/core/src/-private/request.js?L281
-            headers(headers) {
-                // Step 1: get the authorization token as a plain string
-                let token = ''
-                const { authorization } = headers
-                if (
-                    authorization !== undefined &&
-                    typeof authorization[Symbol.iterator] === 'function'
-                ) {
-                    token = [...authorization].at(0) ?? ''
-                } else if (typeof authorization === 'string') {
-                    // token = authorization
-                }
-                // Step 2: if the token is unredacted, redact it so that the ID
-                // is the same regardless if we're in record or replay mode.
-                if (!token.startsWith('token REDACTED')) {
-                    return { authorization: [redactAccessToken(token)] }
-                }
-
-                // We are most likely running in replay mode and don't need to
-                // customize how the token is digested.
-                return { authorization }
-            },
-        },
+        matchRequestsBy: defaultMatchRequestsBy,
     })
+}
+
+const defaultMatchRequestsBy: PollyConfig['matchRequestsBy'] = {
+    order: false,
+
+    // Canonicalize JSON bodies so that we can replay the recording even if the JSON strings
+    // differ by semantically meaningless things like object key enumeration order.
+    body(body) {
+        try {
+            if (typeof body === 'string' && (body.startsWith('{') || body.startsWith('['))) {
+                return jsonStableStringify(JSON.parse(body))
+            }
+        } catch {}
+        return body
+    },
+
+    // The logic below is a bit tricky to follow. Simplified, we need to
+    // ensure that Polly generates the same request ID regardless if
+    // we're running in record mode (with an access token) or in replay
+    // mode (with a redacted token). The ID is computed by Polly as the
+    // MD5 digest of all request "identifiers", which a JSON object that
+    // includes a "headers" property from the result of the function
+    // below. To better understand what's going on, it's helpful to read
+    // the implementation of Polly here:
+    //   https://sourcegraph.com/github.com/Netflix/pollyjs@9b6bede12b7ee998472b8883c9dd01e2159e00a8/-/blob/packages/@pollyjs/core/src/-private/request.js?L281
+    headers(headers): Headers {
+        // Get the authorization token.
+        const { authorization } = headers
+        let header =
+            typeof authorization === 'string'
+                ? authorization
+                : Array.isArray(authorization)
+                  ? authorization.at(0)
+                  : undefined
+
+        // Redact it so that the ID is the same regardless if we're in record or replay
+        // mode.
+        if (header) {
+            header = redactAuthorizationHeader(header)
+        }
+
+        // Normalize to always be a single header value (not an array).
+        return header ? { authorization: header } : {}
+    },
 }
 
 function defaultPollyOptions(

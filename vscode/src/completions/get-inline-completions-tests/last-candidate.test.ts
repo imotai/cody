@@ -3,15 +3,15 @@ import { describe, expect, it, vitest } from 'vitest'
 import * as vscode from 'vscode'
 
 import { range } from '../../testutils/textDocument'
+import type { CompletionLogID } from '../analytics-logger'
 import { getCurrentDocContext } from '../get-current-doc-context'
 import {
     InlineCompletionsResultSource,
     type LastInlineCompletionCandidate,
 } from '../get-inline-completions'
-import type { CompletionLogID } from '../logger'
 import { documentAndPosition } from '../test-helpers'
 
-import { getInlineCompletions, getInlineCompletionsInsertText, params, type V } from './helpers'
+import { type V, getInlineCompletions, getInlineCompletionsInsertText, params } from './helpers'
 
 describe('[getInlineCompletions] reuseLastCandidate', () => {
     function lastCandidate(
@@ -29,7 +29,6 @@ describe('[getInlineCompletions] reuseLastCandidate', () => {
             position,
             maxPrefixLength: 100,
             maxSuffixLength: 100,
-            dynamicMultilineCompletions: false,
             context: lastTriggerSelectedCompletionInfo
                 ? {
                       triggerKind: vscode.InlineCompletionTriggerKind.Automatic,
@@ -234,6 +233,27 @@ describe('[getInlineCompletions] reuseLastCandidate', () => {
             await getInlineCompletions(params('x█', [], { lastCandidate: lastCandidate('█', 'x\ny') }))
         ).toEqual<V>({
             items: [{ insertText: '\ny' }],
+            source: InlineCompletionsResultSource.LastCandidate,
+        }))
+
+    it('handles automatically-inserted semis', async () =>
+        // The user types `console.log()` and puts the cursor between brackets. Then they sees
+        // the ghost text `'hello world');` and save a TypeScript document with automatically
+        // inserted semis, changing the suffix to `);`. The completion should update the insert
+        // range to not show the semi twice.
+        expect(
+            await getInlineCompletions(
+                params('console.log(█);', [], {
+                    lastCandidate: lastCandidate(
+                        'console.log(█)',
+                        '"Hello from Vienna!");',
+                        undefined,
+                        range(0, 12, 0, 13)
+                    ),
+                })
+            )
+        ).toEqual<V>({
+            items: [{ insertText: '"Hello from Vienna!");', range: range(0, 12, 0, 14) }],
             source: InlineCompletionsResultSource.LastCandidate,
         }))
 
