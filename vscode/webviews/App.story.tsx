@@ -1,26 +1,22 @@
-import type { ComponentMeta, ComponentStoryObj } from '@storybook/react'
+import type { Meta, StoryObj } from '@storybook/react'
 
-import { defaultAuthStatus } from '../src/chat/protocol'
-
+import { AUTH_STATUS_FIXTURE_AUTHED, CLIENT_CAPABILITIES_FIXTURE } from '@sourcegraph/cody-shared'
+import { dummyClientConfigForTest } from '@sourcegraph/cody-shared/src/sourcegraph-api/clientConfig'
 import { App } from './App'
-import { VSCodeStoryDecorator } from './storybook/VSCodeStoryDecorator'
+import { VSCodeWebview } from './storybook/VSCodeStoryDecorator'
+import { View } from './tabs'
 import type { VSCodeWrapper } from './utils/VSCodeApi'
 
-const meta: ComponentMeta<typeof App> = {
+const meta: Meta<typeof App> = {
     title: 'cody/App',
     component: App,
-
-    decorators: [VSCodeStoryDecorator],
+    decorators: [story => <div style={{ height: '80vh' }}> {story()} </div>, VSCodeWebview],
 }
 
 export default meta
 
-export const Simple: ComponentStoryObj<typeof App> = {
-    render: () => (
-        <div style={{ background: 'rgb(28, 33, 40)' }}>
-            <App vscodeAPI={dummyVSCodeAPI} />
-        </div>
-    ),
+export const Simple: StoryObj<typeof meta> = {
+    render: () => <App vscodeAPI={dummyVSCodeAPI} />,
 }
 
 const dummyVSCodeAPI: VSCodeWrapper = {
@@ -29,30 +25,41 @@ const dummyVSCodeAPI: VSCodeWrapper = {
         cb({
             type: 'config',
             config: {
-                debugEnable: true,
                 serverEndpoint: 'https://example.com',
-                os: 'linux',
-                arch: 'x64',
-                homeDir: '/home/user',
                 uiKindIsWeb: false,
-                extensionVersion: '0.0.0',
-                experimentalGuardrails: false,
+                experimentalNoodle: false,
+                smartApply: false,
+                hasEditCapability: false,
+                allowEndpointChange: true,
+                experimentalPromptEditorEnabled: false,
             },
+            clientCapabilities: CLIENT_CAPABILITIES_FIXTURE,
             authStatus: {
-                ...defaultAuthStatus,
-                isLoggedIn: true,
+                ...AUTH_STATUS_FIXTURE_AUTHED,
+                displayName: 'Tim Lucas',
+                avatarURL: 'https://avatars.githubusercontent.com/u/153?v=4',
                 authenticated: true,
                 hasVerifiedEmail: true,
                 requiresVerifiedEmail: false,
-                siteHasCodyEnabled: true,
-                siteVersion: '5.1.0',
                 endpoint: 'https://example.com',
             },
+            userProductSubscription: null,
             workspaceFolderUris: [],
+            isDotComUser: true,
         })
+        cb({
+            type: 'clientConfig',
+            clientConfig: dummyClientConfigForTest,
+        })
+        if (firstTime) {
+            cb({ type: 'view', view: View.Chat })
+            firstTime = false
+        }
         return () => {}
     },
     postMessage: () => {},
     getState: () => ({}),
     setState: () => {},
 }
+
+let firstTime = true

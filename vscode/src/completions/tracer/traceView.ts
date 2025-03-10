@@ -1,11 +1,8 @@
 import * as vscode from 'vscode'
 
-import { displayPath, isDefined, renderMarkdown } from '@sourcegraph/cody-shared'
+import { displayPath, displayRange, isDefined } from '@sourcegraph/cody-shared'
+import { marked } from 'marked'
 
-import {
-    registerDebugListener as registerSectionObserverDebugListener,
-    SectionHistoryRetriever,
-} from '../context/retrievers/section-history/section-history-retriever'
 import { InlineCompletionsResultSource } from '../get-inline-completions'
 import type { InlineCompletionItemProvider } from '../inline-completion-item-provider'
 import * as statistics from '../statistics'
@@ -61,7 +58,6 @@ export function registerAutocompleteTraceView(
             rerender()
 
             const unsubscribeStatistics = statistics.registerChangeListener(rerender)
-            const unsubscribeSectionObserver = registerSectionObserverDebugListener(rerender)
 
             provider.setTracer(_data => {
                 data = _data
@@ -71,7 +67,6 @@ export function registerAutocompleteTraceView(
             return {
                 dispose: () => {
                     unsubscribeStatistics()
-                    unsubscribeSectionObserver()
                 },
             }
         }),
@@ -129,7 +124,7 @@ ${markdownList({ ...otherOptions, completionIntent: completionIntent || 'unknown
             : `
 ## Context
 
-${data.context ? markdownList(data.context.logSummary) : ''}
+${data.context ? markdownList(data.context.contextSummary) : ''}
 
 ${
     data.context === null || data.context.context.length === 0
@@ -162,12 +157,12 @@ ${
               ),
               data.completionProviderCallResult.debugMessage
                   ? codeDetailsWithSummary(
-                          'Timing',
-                          data.completionProviderCallResult.debugMessage,
-                          undefined,
-                          undefined,
-                          true
-                      )
+                        'Timing',
+                        data.completionProviderCallResult.debugMessage,
+                        undefined,
+                        undefined,
+                        true
+                    )
                   : null,
           ]
               .filter(isDefined)
@@ -195,8 +190,8 @@ ${
         : data.result.items.length === 0
           ? 'Empty completions.'
           : data.result.items
-                  .map(item => inlineCompletionItemDescription(item, data.params?.document))
-                  .join('\n\n---\n\n')
+                .map(item => inlineCompletionItemDescription(item, data.params?.document))
+                .join('\n\n---\n\n')
 }`,
 
         data?.error &&
@@ -205,12 +200,6 @@ ${
 
 ${markdownCodeBlock(data.error)}
 `,
-        SectionHistoryRetriever.instance
-            ? `
-## Document sections
-
-${documentSections()}`
-            : '',
 
         `
 ## Advanced tools
@@ -224,7 +213,7 @@ ${codeDetailsWithSummary('JSON for dataset', jsonForDataset(data))}
         .map(s => s.trim())
         .join('\n\n---\n\n')
 
-    return renderMarkdown(markdownSource, { noDomPurify: true })
+    return marked(markdownSource)
 }
 
 function statisticSummary(): string {
@@ -232,13 +221,6 @@ function statisticSummary(): string {
     return `📈 Suggested: ${suggested} | Accepted: ${accepted} | Acceptance rate: ${
         suggested === 0 ? 'N/A' : `${((accepted / suggested) * 100).toFixed(2)}%`
     }`
-}
-
-function documentSections(): string {
-    if (!SectionHistoryRetriever.instance) {
-        return ''
-    }
-    return `\`\`\`\n${SectionHistoryRetriever.instance.debugPrint()}\n\`\`\``
 }
 
 function codeDetailsWithSummary(
@@ -313,20 +295,8 @@ ${
 }`
 }
 
-function rangeDescription(range: vscode.Range): string {
-    // The VS Code extension API uses 0-indexed lines and columns, but the UI (and humans) use
-    // 1-indexed lines and columns. Show the latter.
-    return `${range.start.line + 1}:${range.start.character + 1}${
-        range.isEmpty
-            ? ''
-            : `-${range.end.line === range.start.line ? '' : `${range.end.line + 1}:`}${
-                  range.end.character + 1
-              }`
-    }`
-}
-
 function rangeDescriptionWithCurrentText(range: vscode.Range, document?: vscode.TextDocument): string {
-    return `${rangeDescription(range)} (${
+    return `${displayRange(range)} (${
         range.isEmpty
             ? 'empty'
             : document

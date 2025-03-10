@@ -1,111 +1,134 @@
-import { window, type QuickPickItem } from 'vscode'
+import { type QuickPickItem, window } from 'vscode'
 
 import type { CodyCommand } from '@sourcegraph/cody-shared'
 
-import { customPromptsContextOptions } from './items'
-import { CustomCommandType } from '@sourcegraph/cody-shared/src/commands/types'
-import { toSlashCommand } from '../utils/common'
+import { type CodyCommandMode, CustomCommandType } from '@sourcegraph/cody-shared'
+import { telemetryRecorder } from '@sourcegraph/cody-shared'
+import { fromSlashCommand } from '../utils/common'
+import { CommandModeMenuOptions, customPromptsContextOptions } from './items/menu'
 
 export interface CustomCommandsBuilder {
-    slashCommand: string
+    key: string
     prompt: CodyCommand
     type: CustomCommandType
 }
 
 export class CustomCommandsBuilderMenu {
+    /**
+     * Starts the process of creating a new custom Cody command.
+     *
+     * This method prompts the user to enter a command name, select a command mode, and enter a prompt for Cody to follow.
+     * If all the required information is provided, it returns a `CustomCommandsBuilder` object that can be used to create the new custom command.
+     *
+     * @param commands - An array of existing command names to check for duplicates.
+     * @returns A `CustomCommandsBuilder` object if the command creation process is successful, or `null` if the user cancels or the input is invalid.
+     */
     public async start(commands: string[]): Promise<CustomCommandsBuilder | null> {
-        const slashCommand = await this.makeSlashCommand(commands)
-        if (!slashCommand) {
-            return null
+        const key = await this.makeCommandKey(commands)
+        const mode = key && (await this.selectCommandMode())
+        const prompt = mode && (await this.getCommandPrompt())
+        const type = prompt && (await this.selectCommandType())
+
+        if (key && mode && prompt && type) {
+            telemetryRecorder.recordEvent('cody.command.custom.build', 'executed', {
+                billingMetadata: {
+                    product: 'cody',
+                    category: 'core',
+                },
+            })
+
+            return { key, prompt: { ...prompt, key, mode }, type }
         }
 
-        const description = await this.makeDescription()
-        if (!description) {
-            return null
-        }
-
-        const prompt = await this.makePrompt()
-        if (!prompt) {
-            return null
-        }
-
-        const type = await this.makeType()
-        if (!type) {
-            return null
-        }
-
-        return { slashCommand, prompt: { ...prompt, description, slashCommand }, type }
+        return null
     }
 
-    private async makeSlashCommand(commands: string[]): Promise<string | undefined> {
+    /**
+     * STEP 1: Make a new command key
+     * Prompts the user to enter a name for a new custom Cody command, validating that the name is not empty and does not contain spaces.
+     * It also checks that the command name does not already exist in the list of commands.
+     *
+     * @param commands - An array of existing command names.
+     * @returns The new command name entered by the user, or `undefined` if the user cancels the input.
+     */
+    private async makeCommandKey(commands: string[]): Promise<string | undefined> {
         const commandSet = new Set(commands)
-        let value = await window.showInputBox({
-            title: 'New Custom Cody Command: Slash Name',
-            prompt: 'Enter the slash name of the custom command',
-            placeHolder: 'e.g. /my-custom-command',
+        const value = await window.showInputBox({
+            title: 'New Custom Cody Command: Command Name',
+            prompt: 'Enter a unique keyword for the command.',
+            placeHolder: 'e.g. spellchecker',
             ignoreFocusOut: true,
             validateInput: (input: string) => {
                 if (!input) {
-                    return 'Slash name cannot be empty.'
+                    return 'Command name cannot be empty.'
                 }
                 if (input.split(' ').length > 1) {
-                    return 'Slash name cannot contain spaces. Use dashes, underscores, or camelCase.'
+                    return 'Command name cannot contain spaces. Use dashes, underscores, or camelCase.'
                 }
-                if (commandSet.has(toSlashCommand(input))) {
-                    return 'A command with the slash name already exists.'
+                // Remove leading slash before checking if command already exists
+                if (commandSet.has(fromSlashCommand(input).toString())) {
+                    return 'A command with the same name already exists.'
                 }
                 return
             },
         })
-        if (value) {
-            value = toSlashCommand(value)
-        }
+
         return value
     }
 
-    private async makeDescription(): Promise<string | undefined> {
-        const description = await window.showInputBox({
-            title: 'New Custom Cody Command: Description',
-            prompt: 'Enter a description for the command in sentence case.',
-            placeHolder: 'e.g. Scan for vulnerabilities',
-            ignoreFocusOut: true,
-            validateInput: (input: string) => {
-                if (!input) {
-                    return 'Command description cannot be empty.'
-                }
-                return
+    /**
+     * STEP 2: Select a command mode
+     * Displays a quick pick menu to allow the user to select a command mode for a new custom Cody command.
+     * The command mode determines how the command will be executed, such as whether it should run in the current context or in a separate process.
+     *
+     * @returns The selected command mode, or `undefined` if the user cancels the selection.
+     */
+    private async selectCommandMode(): Promise<CodyCommandMode | undefined> {
+        const commandMode = await window.showQuickPick(CommandModeMenuOptions, {
+            title: 'New Custom Cody Command: Command Mode',
+            placeHolder: 'Choose how the command should be executed...',
+            canPickMany: false,
+            onDidSelectItem: (item: QuickPickItem) => {
+                item.picked = !item.picked
             },
         })
-        return description
+
+        return commandMode ? (commandMode.id as CodyCommandMode) : undefined
     }
 
-    private async makePrompt(): Promise<Omit<CodyCommand, 'slashCommand'> | null> {
+    /**
+     * STEP 3: Enter a new prompt for the command
+     * Prompts the user to enter a new custom Cody command prompt and adds the necessary context options for the command.
+     *
+     * @returns The new custom Cody command with the prompt and context, or `null` if the user cancels the operation.
+     */
+    private async getCommandPrompt(): Promise<Omit<CodyCommand, 'key'> | null> {
         const prompt = await window.showInputBox({
             title: 'New Custom Cody Command: Prompt',
             prompt: 'Enter the instructions for Cody to follow and answer.',
             placeHolder: 'e.g. Create five different test cases for the selected code',
             ignoreFocusOut: true,
-            validateInput: (input: string) => {
-                if (!input) {
-                    return 'Command prompt cannot be empty.'
-                }
-                return null
-            },
+            validateInput: (input: string) => (input.length ? null : 'Command prompt cannot be empty.'),
         })
-        if (!prompt) {
-            return null
-        }
-        return this.addContext({ prompt })
+        return prompt ? this.addContext({ prompt }) : null
     }
 
-    private async addContext(
-        newPrompt?: Omit<CodyCommand, 'slashCommand'>
-    ): Promise<Omit<CodyCommand, 'slashCommand'> | null> {
-        if (!newPrompt) {
-            return null
-        }
-
-        newPrompt.context = { ...{ codebase: false } }
+    /**
+     * STEP 4: Add context to the new Cody command
+     * Adds context options to the new Cody command.
+     * This function allows the user to select which context options to include in the new Cody command. The available context options are:
+     * - Selection: Include the current text selection in the prompt context.
+     * - Current Directory: Include the current working directory in the prompt context.
+     * - Open Tabs: Include the currently open tabs in the prompt context.
+     * - None: Include no additional context in the prompt.
+     * - Command: Allow the user to enter a terminal command to run from the workspace root, and include its output in the prompt context.
+     *
+     * If the user does not select any context options, the function will return the new Cody command without any additional context.
+     *
+     * @param newPrompt - The new Cody command to add context to.
+     * @returns The new Cody command with the selected context options, or null if no prompt was provided.
+     */
+    private async addContext(newPrompt: Partial<CodyCommand>): Promise<CodyCommand | null> {
         const promptContext = await window.showQuickPick(customPromptsContextOptions, {
             title: 'New Custom Cody Command: Context Options',
             placeHolder: 'For accurate responses, choose only the necessary options.',
@@ -116,29 +139,34 @@ export class CustomCommandsBuilderMenu {
             },
         })
 
-        if (!promptContext?.length) {
-            return newPrompt
-        }
-
-        for (const context of promptContext) {
-            switch (context.id) {
-                case 'selection':
-                case 'currentDir':
-                case 'openTabs':
-                case 'none':
-                    newPrompt.context[context.id] = context.picked
-                    break
-                case 'command': {
-                    newPrompt.context.command = (await showPromptCreationInputBox()) || ''
-                    break
+        if (promptContext !== undefined) {
+            newPrompt.context = { selection: false }
+            for (const context of promptContext) {
+                switch (context.id) {
+                    case 'selection':
+                    case 'currentFile':
+                    case 'currentDir':
+                    case 'openTabs':
+                    case 'none':
+                        newPrompt.context[context.id] = context.picked
+                        break
+                    case 'command': {
+                        newPrompt.context.command = (await showPromptCreationInputBox()) ?? undefined
+                        break
+                    }
                 }
             }
         }
 
-        return newPrompt
+        return newPrompt as CodyCommand
     }
 
-    private async makeType(): Promise<CustomCommandType> {
+    /**
+     * STEP 5: Save the new Cody command
+     * Prompts the user to choose whether to save a custom Cody command to the user or workspace settings.
+     * @returns A promise that resolves to the chosen `CustomCommandType`.
+     */
+    private async selectCommandType(): Promise<CustomCommandType> {
         const option = await window.showQuickPick(
             [
                 {
@@ -161,6 +189,10 @@ export class CustomCommandsBuilderMenu {
                 placeHolder: 'Choose where to save the command',
             }
         )
+
+        if (!option?.type) {
+            throw new Error('Custom Command creation aborted.')
+        }
 
         return option?.type === CustomCommandType.Workspace
             ? CustomCommandType.Workspace

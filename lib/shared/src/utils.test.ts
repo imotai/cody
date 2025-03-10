@@ -7,6 +7,12 @@ import {
 } from './utils'
 
 describe('convertGitCloneURLToCodebaseName', () => {
+    it('fails to converts repo names that are not valid URLs', () => {
+        expect(convertGitCloneURLToCodebaseName('github.com/foo/bar')).toEqual(null)
+        expect(convertGitCloneURLToCodebaseName('example.com/foo')).toEqual(null)
+        expect(convertGitCloneURLToCodebaseName('gitlab.com/foo/bar/baz')).toEqual(null)
+    })
+
     it('converts Azure DevOps URL', () => {
         expect(
             convertGitCloneURLToCodebaseName(
@@ -69,6 +75,32 @@ describe('convertGitCloneURLToCodebaseName', () => {
         expect(
             convertGitCloneURLToCodebaseName('https://gitlab.com/sourcegraph/sourcegraph.git')
         ).toEqual('gitlab.com/sourcegraph/sourcegraph')
+    })
+
+    it('converts Gitlab SSH URL with Git and subgroups', () => {
+        expect(
+            convertGitCloneURLToCodebaseName('git@gitlab.com:sourcegraph/ui/sourcegraph-frontend.git')
+        ).toEqual('gitlab.com/sourcegraph/ui/sourcegraph-frontend')
+    })
+
+    it('converts Gitlab SSH URL with Git and multiple subgroups', () => {
+        expect(
+            convertGitCloneURLToCodebaseName(
+                'git@gitlab.com:sourcegraph/ui/cody-ui/sourcegraph-frontend.git'
+            )
+        ).toEqual('gitlab.com/sourcegraph/ui/cody-ui/sourcegraph-frontend')
+    })
+
+    it('converts custom hosts with a mono-repo', () => {
+        expect(
+            convertGitCloneURLToCodebaseName('some-user@my-custom-host.com.internal:mono-repo')
+        ).toEqual('my-custom-host.com.internal/mono-repo')
+    })
+
+    it('converts custom hosts with a port', () => {
+        expect(
+            convertGitCloneURLToCodebaseName('some-user@my-custom-host.com.internal:2022/owner/repo.git')
+        ).toEqual('my-custom-host.com.internal:2022/owner/repo')
     })
 
     it('converts GitHub SSH URL with Git', () => {

@@ -33,19 +33,21 @@ export class EditCodeAction implements vscode.CodeActionProvider {
         document: vscode.TextDocument,
         selection: vscode.Selection
     ): vscode.CodeAction {
-        const displayText = 'Ask Cody to Generate'
+        const displayText = 'Cody: Generate Code'
         const source = 'code-action:generate'
         const action = new vscode.CodeAction(displayText, vscode.CodeActionKind.RefactorRewrite)
         action.command = {
             command: 'cody.command.edit-code',
             arguments: [
                 {
-                    range: new vscode.Range(selection.start, selection.end),
-                    intent: 'add',
-                    document,
-                    mode: 'insert',
+                    configuration: {
+                        range: new vscode.Range(selection.start, selection.end),
+                        intent: 'add',
+                        document,
+                        mode: 'insert',
+                    },
+                    source,
                 } satisfies ExecuteEditArguments,
-                source,
             ],
             title: displayText,
         }
@@ -56,18 +58,20 @@ export class EditCodeAction implements vscode.CodeActionProvider {
         document: vscode.TextDocument,
         selection: vscode.Selection
     ): vscode.CodeAction {
-        const displayText = 'Ask Cody to Edit'
+        const displayText = 'Cody: Edit Code'
         const source = 'code-action:edit'
         const action = new vscode.CodeAction(displayText, vscode.CodeActionKind.RefactorRewrite)
         action.command = {
             command: 'cody.command.edit-code',
             arguments: [
                 {
-                    range: new vscode.Range(selection.start, selection.end),
-                    intent: 'edit',
-                    document,
+                    configuration: {
+                        range: new vscode.Range(selection.start, selection.end),
+                        intent: 'edit',
+                        document,
+                    },
+                    source,
                 } satisfies ExecuteEditArguments,
-                source,
             ],
             title: displayText,
         }

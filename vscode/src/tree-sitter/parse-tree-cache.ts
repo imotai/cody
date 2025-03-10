@@ -3,16 +3,19 @@ import * as vscode from 'vscode'
 import type { TextDocument } from 'vscode'
 import type { default as Parser, Tree } from 'web-tree-sitter'
 
-import { getParseLanguage, type SupportedLanguage } from './grammars'
-import { createParser, getParser } from './parser'
+import { type SupportedLanguage, isSupportedLanguage } from './grammars'
+import { type WrappedParser, createParser, getParser } from './parser'
 
 const parseTreesPerFile = new LRUCache<string, Tree>({
     max: 10,
+    // Important: we need to call `Tree.delete()` to free up memory. Without
+    // this, we leak memory. See CODY-3616.
+    disposeAfter: tree => tree.delete(),
 })
 
 interface ParseTreeCache {
     tree: Tree
-    parser: Parser
+    parser: WrappedParser
     cacheKey: string
 }
 
@@ -34,7 +37,7 @@ export function getCachedParseTreeForDocument(document: TextDocument): ParseTree
     return { tree, parser, cacheKey }
 }
 
-async function parseDocument(document: TextDocument): Promise<void> {
+export async function parseDocument(document: TextDocument): Promise<void> {
     const parseLanguage = getLanguageIfTreeSitterEnabled(document)
 
     if (!parseLanguage) {
@@ -49,13 +52,13 @@ async function parseDocument(document: TextDocument): Promise<void> {
     updateParseTreeCache(document, parser)
 }
 
-export function updateParseTreeCache(document: TextDocument, parser: Parser): void {
-    const tree = parser.parse(document.getText())
+export function updateParseTreeCache(document: TextDocument, parser: WrappedParser): void {
+    const tree = parser.safeParse(document.getText())
     parseTreesPerFile.set(document.uri.toString(), tree)
 }
 
 function getLanguageIfTreeSitterEnabled(document: TextDocument): SupportedLanguage | null {
-    const parseLanguage = getParseLanguage(document.languageId)
+    const { languageId } = document
 
     /**
      * 1. Do not use tree-sitter for unsupported languages.
@@ -65,8 +68,8 @@ function getLanguageIfTreeSitterEnabled(document: TextDocument): SupportedLangua
      *
      *    Needs more testing to figure out if we need it. Playing it safe for the initial integration.
      */
-    if (document.lineCount <= 10_000 && parseLanguage) {
-        return parseLanguage
+    if (document.lineCount <= 10_000 && isSupportedLanguage(languageId)) {
+        return languageId
     }
 
     return null
@@ -106,7 +109,7 @@ export function updateParseTreeOnEdit(edit: vscode.TextDocumentChangeEvent): voi
         })
     }
 
-    const updatedTree = parser.parse(document.getText(), tree)
+    const updatedTree = parser.safeParse(document.getText(), tree)
     parseTreesPerFile.set(cacheKey, updatedTree)
 }
 
@@ -114,8 +117,10 @@ export function asPoint(position: Pick<vscode.Position, 'line' | 'character'>): 
     return { row: position.line, column: position.character }
 }
 
-export function parseAllVisibleDocuments(): void {
+export function parseAllVisibleDocuments(): Promise<unknown> {
+    const promises: Promise<void>[] = []
     for (const editor of vscode.window.visibleTextEditors) {
-        void parseDocument(editor.document)
+        promises.push(parseDocument(editor.document))
     }
+    return Promise.all(promises)
 }

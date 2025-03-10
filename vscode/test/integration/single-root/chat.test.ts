@@ -1,8 +1,8 @@
-import * as assert from 'assert'
+import * as assert from 'node:assert'
 
 import * as vscode from 'vscode'
 
-import type { SimpleChatPanelProvider } from '../../../src/chat/chat-view/SimpleChatPanelProvider'
+import type { ChatController } from '../../../src/chat/chat-view/ChatController'
 
 import {
     afterIntegrationTest,
@@ -13,10 +13,16 @@ import {
     waitUntil,
 } from '../helpers'
 
-async function getChatViewProvider(): Promise<SimpleChatPanelProvider> {
+async function getChatViewProvider(): Promise<ChatController> {
     const chatViewProvider = await getExtensionAPI().exports.testing?.chatPanelProvider.get()
     assert.ok(chatViewProvider)
     return chatViewProvider
+}
+
+// Note: The integration runner can not require from lib-shared so we have to expose
+// this instead.
+function getPs() {
+    return getExtensionAPI().exports.testing?.ps!
 }
 
 suite('Chat', function () {
@@ -24,27 +30,39 @@ suite('Chat', function () {
     this.afterEach(() => afterIntegrationTest())
 
     test('sends and receives a message', async () => {
-        await vscode.commands.executeCommand('cody.chat.panel.new')
+        await vscode.commands.executeCommand('cody.chat.newEditorPanel')
         const chatView = await getChatViewProvider()
-        await chatView.handleUserMessageSubmission('test', 'hello from the human', 'user', [], false)
+        await chatView.handleUserMessage({
+            requestID: 'test',
+            inputText: getPs()`hello from the human`,
+            mentions: [],
+            editorState: null,
+            signal: new AbortController().signal,
+        })
 
-        assert.match((await getTranscript(0)).displayText || '', /^hello from the human$/)
+        assert.match((await getTranscript(0)).text?.toString() || '', /^hello from the human$/)
         await waitUntil(async () =>
-            /^hello from the assistant$/.test((await getTranscript(1)).displayText || '')
+            /^hello from the assistant$/.test((await getTranscript(1)).text?.toString() || '')
         )
     })
 
     // do not display filename even when there is a selection in active editor
     test('append current file link to display text on editor selection', async () => {
         await getTextEditorWithSelection()
-        await vscode.commands.executeCommand('cody.chat.panel.new')
+        await vscode.commands.executeCommand('cody.chat.newEditorPanel')
         const chatView = await getChatViewProvider()
-        await chatView.handleUserMessageSubmission('test', 'hello from the human', 'user', [], false)
+        await chatView.handleUserMessage({
+            requestID: 'test',
+            inputText: getPs()`hello from the human`,
+            mentions: [],
+            editorState: null,
+            signal: new AbortController().signal,
+        })
 
         // Display text should include file link at the end of message
-        assert.match((await getTranscript(0)).displayText || '', /^hello from the human$/)
+        assert.match((await getTranscript(0)).text?.toString() || '', /^hello from the human$/)
         await waitUntil(async () =>
-            /^hello from the assistant$/.test((await getTranscript(1)).displayText || '')
+            /^hello from the assistant$/.test((await getTranscript(1)).text?.toString() || '')
         )
     })
 })

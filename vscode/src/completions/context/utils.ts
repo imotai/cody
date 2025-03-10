@@ -1,19 +1,36 @@
+const typeScriptFamily = new Set(['typescript', 'typescriptreact'])
+const javaScriptFamily = new Set(['javascript', 'javascriptreact'])
+
+export enum RetrieverIdentifier {
+    RecentEditsRetriever = 'recent-edits',
+    JaccardSimilarityRetriever = 'jaccard-similarity',
+    TscRetriever = 'tsc',
+    LspLightRetriever = 'lsp-light',
+    RecentCopyRetriever = 'recent-copy',
+    DiagnosticsRetriever = 'diagnostics',
+    RecentViewPortRetriever = 'recent-view-port',
+}
+
+export interface ShouldUseContextParams {
+    baseLanguageId: string
+    languageId: string
+}
+
 /**
- * Returns the base language id for the given language id. This is used to determine which language
- * IDs can be included as context for a given language ID.
- *
- * TODO(beyang): handle JavaScript <-> TypeScript and verify this works for C header files omit
- * files of other languages
+ * Returns true if the given language ID should be used as context for the base
+ * language id.
  */
-export function baseLanguageId(languageId: string): string {
-    switch (languageId) {
-        case 'typescript':
-        case 'typescriptreact':
-            return 'typescript'
-        case 'javascript':
-        case 'javascriptreact':
-            return 'javascript'
-        default:
-            return languageId
+export function shouldBeUsedAsContext({ baseLanguageId, languageId }: ShouldUseContextParams): boolean {
+    if (baseLanguageId === languageId) {
+        return true
     }
+
+    if (typeScriptFamily.has(baseLanguageId) && typeScriptFamily.has(languageId)) {
+        return true
+    }
+    if (javaScriptFamily.has(baseLanguageId) && javaScriptFamily.has(languageId)) {
+        return true
+    }
+
+    return false
 }
