@@ -1,31 +1,33 @@
-import { ModelProvider } from '@sourcegraph/cody-shared'
-import type { AuthProvider } from '../../services/AuthProvider'
-import { type EditModel, ModelUsage } from '@sourcegraph/cody-shared/src/models/types'
+import { type AuthStatus, type EditModel, isDotCom } from '@sourcegraph/cody-shared'
 import type { EditIntent } from '../types'
 
-export function getEditModelsForUser(authProvider: AuthProvider): ModelProvider[] {
-    const authStatus = authProvider.getAuthStatus()
-    if (authStatus?.configOverwrites?.chatModel) {
-        ModelProvider.add(
-            new ModelProvider(authStatus.configOverwrites.chatModel, [
-                ModelUsage.Chat,
-                // TODO: Add configOverwrites.editModel for separate edit support
-                ModelUsage.Edit,
-            ])
-        )
+export function getOverriddenModelForIntent(
+    intent: EditIntent,
+    currentModel: EditModel,
+    authStatus: AuthStatus
+): EditModel {
+    if (!isDotCom(authStatus)) {
+        // We do not want to override the model if the user is connected to an enterprise instance.
+        // We cannot assume what models will be available here.
+        return currentModel
     }
-    return ModelProvider.get(ModelUsage.Edit, authStatus.endpoint)
-}
 
-export function getOverridenModelForIntent(intent: EditIntent, currentModel: EditModel): EditModel {
     switch (intent) {
-        case 'doc':
         case 'fix':
+            // Fix is a case where we want to ensure that users do not end up with a broken edit model.
+            // It is outside of the typical Edit flow so it is more likely a user could become "stuck" here.
+            // TODO: Make the model usage more visible to users outside of the normal edit flow. This means
+            // we could let the user provide any model they want for `fix`.
+            // Issue: https://github.com/sourcegraph/cody/issues/3512
+            return 'anthropic::2024-10-22::claude-3-5-sonnet-latest'
+        case 'doc':
+            // Doc is a case where we can sacrifice LLM performance for improved latency and get comparable results.
+            return 'anthropic::2024-10-22::claude-3-5-haiku-latest'
+
         case 'test':
-            // Edit commands have only been tested with Claude 2. Default to that for now.
-            return 'anthropic/claude-2.0'
         case 'add':
         case 'edit':
+        case 'smartApply':
             // Support all model usage for add and edit intents.
             return currentModel
     }

@@ -1,5 +1,5 @@
 // TODO: use implements vscode.XXX on mocked classes to ensure they match the real vscode API.
-import fspromises from 'fs/promises'
+import fspromises from 'node:fs/promises'
 
 import type * as vscode_types from 'vscode'
 import type {
@@ -9,14 +9,17 @@ import type {
     Range as VSCodeRange,
 } from 'vscode'
 
-import { FeatureFlagProvider, type Configuration, type FeatureFlag } from '@sourcegraph/cody-shared'
+import { type ClientConfiguration, OLLAMA_DEFAULT_URL } from '@sourcegraph/cody-shared'
 
+import path from 'node:path'
 import { AgentEventEmitter as EventEmitter } from './AgentEventEmitter'
+import { AgentWorkspaceEdit as WorkspaceEdit } from './AgentWorkspaceEdit'
 import { Uri } from './uri'
 
 export { Uri } from './uri'
 
 export { AgentEventEmitter as EventEmitter } from './AgentEventEmitter'
+export { AgentWorkspaceEdit as WorkspaceEdit } from './AgentWorkspaceEdit'
 export { Disposable } from './Disposable'
 
 /**
@@ -71,6 +74,13 @@ export enum OverviewRulerLane {
     Center = 2,
     Right = 4,
     Full = 7,
+}
+
+export enum DecorationRangeBehavior {
+    OpenOpen = 0,
+    ClosedClosed = 1,
+    OpenClosed = 2,
+    ClosedOpen = 3,
 }
 
 export class CodeLens {
@@ -139,6 +149,12 @@ export enum ExtensionMode {
     Development = 2,
     Test = 3,
 }
+export class DiagnosticRelatedInformation {
+    constructor(
+        public readonly location: Location,
+        public readonly message: string
+    ) {}
+}
 export enum DiagnosticSeverity {
     Error = 0,
     Warning = 1,
@@ -201,18 +217,21 @@ export class CodeAction {
 }
 export class CodeActionKind {
     static readonly Empty = new CodeActionKind('Empty')
-    static readonly QuickFix = new CodeActionKind('')
-    static readonly Refactor = new CodeActionKind('')
-    static readonly RefactorExtract = new CodeActionKind('')
-    static readonly RefactorInline = new CodeActionKind('')
-    static readonly RefactorMove = new CodeActionKind('')
-    static readonly RefactorRewrite = new CodeActionKind('')
-    static readonly Source = new CodeActionKind('')
-    static readonly SourceOrganizeImports = new CodeActionKind('')
-
-    static readonly SourceFixAll = new CodeActionKind('')
+    static readonly QuickFix = new CodeActionKind('QuickFix')
+    static readonly Refactor = new CodeActionKind('Refactor')
+    static readonly RefactorExtract = new CodeActionKind('RefactorExtract')
+    static readonly RefactorInline = new CodeActionKind('RefactorInline')
+    static readonly RefactorMove = new CodeActionKind('RefactorMove')
+    static readonly RefactorRewrite = new CodeActionKind('RefactorRewrite')
+    static readonly Source = new CodeActionKind('Source')
+    static readonly SourceOrganizeImports = new CodeActionKind('SourceOrganizeImports')
+    static readonly SourceFixAll = new CodeActionKind('SourceFixAll')
 
     constructor(public readonly value: string) {}
+}
+export enum NotebookCellKind {
+    Markup = 1,
+    Code = 2,
 }
 // biome-ignore lint/complexity/noStaticOnlyClass: mock
 export class QuickInputButtons {
@@ -297,6 +316,34 @@ export class Position implements VSCodePosition {
     public compareTo(other: VSCodePosition): number {
         return this.isBefore(other) ? -1 : this.isAfter(other) ? 1 : 0
     }
+
+    static Min(...positions: Position[]): Position {
+        if (positions.length === 0) {
+            throw new TypeError()
+        }
+        let result = positions[0]
+        for (let i = 1; i < positions.length; i++) {
+            const p = positions[i]
+            if (p.isBefore(result)) {
+                result = p
+            }
+        }
+        return result
+    }
+
+    static Max(...positions: Position[]): Position {
+        if (positions.length === 0) {
+            throw new TypeError()
+        }
+        let result = positions[0]
+        for (let i = 1; i < positions.length; i++) {
+            const p = positions[i]
+            if (p.isAfter(result)) {
+                result = p
+            }
+        }
+        return result
+    }
 }
 
 export class Location implements VSCodeLocation {
@@ -312,6 +359,14 @@ export class Location implements VSCodeLocation {
             this.range = rangeOrPosition
         }
     }
+}
+
+const isSmallerOrEqualPosition = (a: Position, b: Position): boolean => {
+    return a.line < b.line || (a.line === b.line && a.character <= b.character)
+}
+
+const isBiggerOrEqualPosition = (a: Position, b: Position): boolean => {
+    return a.line > b.line || (a.line === b.line && a.character >= b.character)
 }
 
 export class Range implements VSCodeRange {
@@ -377,17 +432,30 @@ export class Range implements VSCodeRange {
     public contains(positionOrRange: Position | Range): boolean {
         if ('line' in positionOrRange) {
             return (
-                positionOrRange.line >= this.start.line &&
-                positionOrRange.line <= this.end.line &&
-                positionOrRange.character >= this.start.character &&
-                positionOrRange.character <= this.end.character
+                isSmallerOrEqualPosition(this.start, positionOrRange) &&
+                isSmallerOrEqualPosition(positionOrRange, this.end)
+            )
+        }
+        if ('start' in positionOrRange && 'end' in positionOrRange) {
+            return (
+                isSmallerOrEqualPosition(this.start, positionOrRange.start) &&
+                isSmallerOrEqualPosition(positionOrRange.start, this.end) &&
+                isBiggerOrEqualPosition(this.end, positionOrRange.end)
             )
         }
 
         throw new Error('not implemented')
     }
-    public intersection(): VSCodeRange | undefined {
-        throw new Error('not implemented')
+    public intersection(other: VSCodeRange): VSCodeRange | undefined {
+        const start = Position.Max(other.start, this.start)
+        const end = Position.Min(other.end, this.end)
+        if (start.isAfter(end)) {
+            // this happens when there is no overlap:
+            // |-----|
+            //          |----|
+            return undefined
+        }
+        return new Range(start, end)
     }
     public union(): VSCodeRange {
         throw new Error('not implemented')
@@ -434,6 +502,10 @@ export class Selection extends Range {
     isReversed = false
 }
 
+export enum CodeActionTriggerKind {
+    Invoke = 1,
+    Automatic = 2,
+}
 export enum FoldingRangeKind {
     Comment = 1,
     Imports = 2,
@@ -458,15 +530,6 @@ export class InlineCompletionItem {
 }
 
 // TODO(abeatrix): Implement delete and insert mocks
-export class WorkspaceEdit {
-    public delete(uri: vscode_types.Uri, range: Range): Range {
-        return range
-    }
-    public insert(uri: vscode_types.Uri, position: Position, content: string): string {
-        return content
-    }
-}
-
 export enum EndOfLine {
     LF = 1,
     CRLF = 2,
@@ -510,8 +573,8 @@ export const workspaceFs: typeof vscode_types.workspace.fs = {
             : stat.isDirectory()
               ? FileType.Directory
               : stat.isSymbolicLink()
-                  ? FileType.SymbolicLink
-                  : FileType.Unknown
+                ? FileType.SymbolicLink
+                : FileType.Unknown
 
         return {
             type,
@@ -531,8 +594,8 @@ export const workspaceFs: typeof vscode_types.workspace.fs = {
                 : entry.isDirectory()
                   ? FileType.Directory
                   : entry.isSymbolicLink()
-                      ? FileType.SymbolicLink
-                      : FileType.Unknown
+                    ? FileType.SymbolicLink
+                    : FileType.Unknown
 
             return [entry.name, type]
         })
@@ -541,10 +604,15 @@ export const workspaceFs: typeof vscode_types.workspace.fs = {
         await fspromises.mkdir(uri.fsPath, { recursive: true })
     },
     readFile: async uri => {
-        const content = await fspromises.readFile(uri.fsPath)
-        return new Uint8Array(content.buffer)
+        try {
+            const content = await fspromises.readFile(uri.fsPath)
+            return new Uint8Array(content.buffer)
+        } catch (error) {
+            throw new Error(`no such file: ${uri}`, { cause: error })
+        }
     },
     writeFile: async (uri, content) => {
+        await fspromises.mkdir(path.dirname(uri.fsPath), { recursive: true })
         await fspromises.writeFile(uri.fsPath, content)
     },
     delete: async (uri, options) => {
@@ -672,16 +740,40 @@ const languages: Partial<typeof vscode_types.languages> = {
             'vimrc',
         ])
     },
+    getDiagnostics() {
+        return []
+    },
+    registerCodeLensProvider() {
+        return { dispose: () => {} }
+    },
 }
 
+export enum TextDocumentChangeReason {
+    Undo = 1,
+    Redo = 2,
+}
 export enum UIKind {
     Desktop = 1,
     Web = 2,
 }
 
+export enum ProgressLocation {
+    SourceControl = 1,
+    Window = 10,
+    Notification = 15,
+}
+
+export class FileSystemError extends Error {
+    public code = 'FileSystemError'
+}
+
+export const vscodeWorkspaceTextDocuments: vscode_types.TextDocument[] = []
+
 export const vsCodeMocks = {
+    FileSystemError,
     FileType,
     Range,
+    Selection,
     Position,
     InlineCompletionItem,
     EventEmitter,
@@ -694,7 +786,9 @@ export const vsCodeMocks = {
     UIKind,
     QuickInputButtons,
     Uri,
+    Location,
     languages,
+    version: '1.85.1-testing',
     env: {
         uiKind: 1 satisfies vscode_types.UIKind.Desktop,
     },
@@ -709,31 +803,51 @@ export const vsCodeMocks = {
         showErrorMessage(message: string) {
             console.error(message)
         },
+        activeNotebookEditor: undefined,
         activeTextEditor: {
             document: { uri: { scheme: 'not-cody' } },
             options: { tabSize: 4 },
+            selection: {},
         },
+        onDidChangeVisibleTextEditors() {},
         onDidChangeActiveTextEditor() {},
+        onDidChangeTextEditorSelection() {},
+        onDidChangeTextEditorVisibleRanges() {},
+        onDidChangeNotebookEditorVisibleRanges() {},
+        onDidChangeActiveNotebookEditor() {},
+        onDidChangeWindowState() {},
+        state: { focused: false },
         createTextEditorDecorationType: () => ({
             key: 'foo',
             dispose: () => {},
         }),
+        withProgress: async (
+            options: vscode_types.ProgressOptions,
+            task: (
+                progress: vscode_types.Progress<{ message?: string; increment?: number }>,
+                token: CancellationToken
+            ) => Thenable<unknown>
+        ) => {
+            const cancel = new CancellationTokenSource()
+            return await task({ report: () => {} }, cancel.token)
+        },
         visibleTextEditors: [],
         tabGroups: { all: [] },
     },
     commands: {
         registerCommand: () => ({ dispose: () => {} }),
+        executeCommand: () => Promise.resolve(),
     },
     workspace: {
         fs: workspaceFs,
         getConfiguration() {
             return {
-                get(key: string) {
+                get(key: string, defaultValue: unknown = undefined) {
                     switch (key) {
                         case 'cody.debug.filter':
                             return '.*'
                         default:
-                            return ''
+                            return defaultValue
                     }
                 },
                 update(): void {},
@@ -748,9 +862,17 @@ export const vsCodeMocks = {
         asRelativePath(path: string | vscode_types.Uri) {
             return path.toString()
         },
+        registerTextDocumentContentProvider() {},
         onDidChangeTextDocument() {},
+        onDidOpenTextDocument() {},
+        onDidCloseTextDocument() {},
+        onDidCreateFiles() {},
         onDidRenameFiles() {},
         onDidDeleteFiles() {},
+        textDocuments: vscodeWorkspaceTextDocuments,
+        workspaceFolders: undefined,
+        getWorkspaceFolder: () => undefined,
+        onDidChangeWorkspaceFolders: () => {},
     },
     ConfigurationTarget: {
         Global: undefined,
@@ -762,81 +884,71 @@ export const vsCodeMocks = {
     },
     InlineCompletionTriggerKind,
     SymbolKind,
+    QuickPickItemKind,
+    DecorationRangeBehavior,
     FoldingRange,
     FoldingRangeKind,
     CodeActionKind,
+    NotebookCellKind,
     DiagnosticSeverity,
     ViewColumn,
+    TextDocumentChangeReason,
+    ProgressLocation,
 } as const
 
-export enum ProgressLocation {
-    SourceControl = 1,
-    Window = 10,
-    Notification = 15,
-}
-
-export class MockFeatureFlagProvider extends FeatureFlagProvider {
-    constructor(private readonly enabledFlags: Set<FeatureFlag>) {
-        super(null as any)
-    }
-
-    public evaluateFeatureFlag(flag: FeatureFlag): Promise<boolean> {
-        return Promise.resolve(this.enabledFlags.has(flag))
-    }
-
-    public getFromCache(flag: FeatureFlag): boolean {
-        return this.enabledFlags.has(flag)
-    }
-
-    public syncAuthStatus(): Promise<void> {
-        return Promise.resolve()
-    }
-}
-
-export const emptyMockFeatureFlagProvider = new MockFeatureFlagProvider(new Set<FeatureFlag>())
-
 export const DEFAULT_VSCODE_SETTINGS = {
-    proxy: null,
+    net: {
+        mode: undefined,
+        proxy: {
+            cacert: undefined,
+            endpoint: undefined,
+            skipCertValidation: false,
+        },
+        vscode: '{}',
+    },
     codebase: '',
-    customHeaders: {},
-    chatPreInstruction: '',
-    useContext: 'embeddings',
+    serverEndpoint: undefined,
+    customHeaders: undefined,
     autocomplete: true,
     autocompleteLanguages: {
         '*': true,
     },
     commandCodeLenses: false,
-    editorTitleCommandIcon: true,
-    experimentalGuardrails: false,
-    experimentalSimpleChatContext: true,
-    experimentalSymfContext: true,
+    experimentalSupercompletions: false,
+    experimentalAutoEditEnabled: false,
+    experimentalAutoEditRendererTesting: false,
+    experimentalAutoEditConfigOverride: undefined,
+    experimentalMinionAnthropicKey: undefined,
     experimentalTracing: false,
+    experimentalNoodle: false,
+    experimentalNoxideEnabled: true,
     codeActions: true,
     commandHints: false,
     isRunningInsideAgent: false,
     agentIDE: undefined,
-    debugEnable: false,
+    agentHasPersistentStorage: false,
+    hasNativeWebview: true,
     debugVerbose: false,
     debugFilter: null,
     telemetryLevel: 'all',
     internalUnstable: false,
-    autocompleteAdvancedProvider: null,
+    internalDebugContext: false,
+    internalDebugState: false,
+    agenticContextExperimentalOptions: {},
+    autocompleteAdvancedProvider: 'default',
     autocompleteAdvancedModel: null,
     autocompleteCompleteSuggestWidgetSelection: true,
     autocompleteFormatOnAccept: true,
-    autocompleteExperimentalDynamicMultilineCompletions: false,
-    autocompleteExperimentalHotStreak: false,
-    autocompleteExperimentalFastPath: false,
+    autocompleteDisableInsideComments: false,
     autocompleteExperimentalGraphContext: null,
     autocompleteExperimentalOllamaOptions: {
         model: 'codellama:7b-code',
-        url: 'http://localhost:11434',
+        url: OLLAMA_DEFAULT_URL,
     },
-    autocompleteTimeouts: {
-        multiline: undefined,
-        singleline: undefined,
-    },
-    testingLocalEmbeddingsEndpoint: undefined,
-    testingLocalEmbeddingsIndexLibraryPath: undefined,
-    testingLocalEmbeddingsModel: undefined,
-} satisfies Configuration
+    autocompleteFirstCompletionTimeout: 3500,
+    experimentalGuardrailsTimeoutSeconds: undefined,
+    overrideAuthToken: undefined,
+    overrideServerEndpoint: undefined,
+    authExternalProviders: [],
+    rulesEnabled: false,
+} satisfies ClientConfiguration

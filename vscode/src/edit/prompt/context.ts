@@ -1,31 +1,36 @@
-import type * as vscode from 'vscode'
+import * as vscode from 'vscode'
 
 import {
+    type ContextItem,
+    ContextItemSource,
+    type ContextMessage,
     MAX_CURRENT_FILE_TOKENS,
-    createContextMessageByFile,
-    getContextMessageWithResponse,
+    type PromptString,
     populateCodeContextTemplate,
     populateCodeGenerationContextTemplate,
     populateCurrentEditorDiagnosticsTemplate,
-    truncateText,
-    truncateTextStart,
-    type CodyCommand,
-    type ContextFile,
-    type ContextMessage,
+    ps,
 } from '@sourcegraph/cody-shared'
 
 import type { VSCodeEditor } from '../../editor/vscode-editor'
 import type { EditIntent } from '../types'
 
+import { truncatePromptString, truncatePromptStringStart } from '@sourcegraph/cody-shared'
+import { resolveContextItems } from '../../editor/utils/editor-context'
 import { PROMPT_TOPICS } from './constants'
 import { extractContextItemsFromContextMessages } from './utils'
-import type { ContextItem } from '../../prompt-builder/types'
 
 interface GetContextFromIntentOptions {
     intent: EditIntent
-    selectedText: string
-    precedingText: string
-    followingText: string
+    selectedText: PromptString
+    prefix: {
+        text: PromptString
+        range: vscode.Range
+    }
+    suffix: {
+        text: PromptString
+        range: vscode.Range
+    }
     uri: vscode.Uri
     selectionRange: vscode.Range
     editor: VSCodeEditor
@@ -33,35 +38,46 @@ interface GetContextFromIntentOptions {
 
 const getContextFromIntent = async ({
     intent,
-    precedingText,
-    followingText,
+    prefix,
+    suffix,
     uri,
     selectionRange,
     editor,
 }: GetContextFromIntentOptions): Promise<ContextMessage[]> => {
-    const truncatedPrecedingText = truncateTextStart(precedingText, MAX_CURRENT_FILE_TOKENS)
-    const truncatedFollowingText = truncateText(followingText, MAX_CURRENT_FILE_TOKENS)
+    const truncatedPrecedingText = await truncatePromptStringStart(prefix.text, MAX_CURRENT_FILE_TOKENS)
+    const truncatedFollowingText = await truncatePromptString(suffix.text, MAX_CURRENT_FILE_TOKENS)
 
     // Disable no case declarations because we get better type checking with a switch case
     switch (intent) {
+        /**
+         * The context for the test intent is handled by the executeTestEditCommand function,
+         * we don't need to add additional context here to avoid duplication.
+         */
+        case 'test':
+            return []
         /**
          * Very broad set of possible instructions.
          * Fetch context from the users' instructions and use context from current file.
          * Include the following code from the current file.
          * The preceding code is already included as part of the response to better guide the output.
          */
-        case 'test':
         case 'add': {
             return [
-                ...getContextMessageWithResponse(
-                    populateCodeGenerationContextTemplate(
-                        `<${PROMPT_TOPICS.PRECEDING}>${truncatedPrecedingText}</${PROMPT_TOPICS.PRECEDING}>`,
-                        `<${PROMPT_TOPICS.FOLLOWING}>${truncatedFollowingText}</${PROMPT_TOPICS.FOLLOWING}>`,
+                {
+                    speaker: 'human',
+                    text: populateCodeGenerationContextTemplate(
+                        ps`<${PROMPT_TOPICS.PRECEDING}>${truncatedPrecedingText}</${PROMPT_TOPICS.PRECEDING}>`,
+                        ps`<${PROMPT_TOPICS.FOLLOWING}>${truncatedFollowingText}</${PROMPT_TOPICS.FOLLOWING}>`,
                         uri,
                         PROMPT_TOPICS.OUTPUT
                     ),
-                    { type: 'file', uri }
-                ),
+                    file: {
+                        type: 'file',
+                        uri,
+                        source: ContextItemSource.Editor,
+                        range: new vscode.Range(prefix.range.start, suffix.range.end),
+                    },
+                },
             ]
         }
         /**
@@ -74,28 +90,20 @@ const getContextFromIntent = async ({
          * Fetching context is unlikely to be very helpful or optimal.
          */
         case 'doc': {
-            const contextMessages = []
+            const contextMessages: ContextMessage[] = []
             if (truncatedPrecedingText.trim().length > 0) {
-                contextMessages.push(
-                    ...getContextMessageWithResponse(
-                        populateCodeContextTemplate(truncatedPrecedingText, uri, undefined, 'edit'),
-                        {
-                            type: 'file',
-                            uri,
-                        }
-                    )
-                )
+                contextMessages.push({
+                    speaker: 'human',
+                    text: populateCodeContextTemplate(truncatedPrecedingText, uri, undefined, 'edit'),
+                    file: { type: 'file', uri, source: ContextItemSource.Editor, range: prefix.range },
+                })
             }
             if (truncatedFollowingText.trim().length > 0) {
-                contextMessages.push(
-                    ...getContextMessageWithResponse(
-                        populateCodeContextTemplate(truncatedFollowingText, uri, undefined, 'edit'),
-                        {
-                            type: 'file',
-                            uri,
-                        }
-                    )
-                )
+                contextMessages.push({
+                    speaker: 'human',
+                    text: populateCodeContextTemplate(truncatedFollowingText, uri, undefined, 'edit'),
+                    file: { type: 'file', uri, source: ContextItemSource.Editor, range: suffix.range },
+                })
             }
             return contextMessages
         }
@@ -104,70 +112,56 @@ const getContextFromIntent = async ({
          * Fetch context from the users' selection, use any errors/warnings in said selection, and use context from current file.
          * Non-code files are not considered as including Markdown syntax seems to lead to more hallucinations and poorer output quality.
          */
-        case 'edit': {
+        case 'edit':
+        case 'smartApply': {
             const range = selectionRange
             const diagnostics = range ? editor.getActiveTextEditorDiagnosticsForRange(range) || [] : []
             const errorsAndWarnings = diagnostics.filter(
                 ({ type }) => type === 'error' || type === 'warning'
             )
             return [
-                ...errorsAndWarnings.flatMap(diagnostic =>
-                    getContextMessageWithResponse(
-                        populateCurrentEditorDiagnosticsTemplate(diagnostic, uri),
-                        {
-                            type: 'file',
-                            uri,
-                        }
-                    )
+                ...errorsAndWarnings.flatMap(
+                    diagnostic =>
+                        ({
+                            speaker: 'human' as const,
+                            text: populateCurrentEditorDiagnosticsTemplate(diagnostic, uri),
+                            file: { type: 'file', uri, source: ContextItemSource.Editor },
+                        }) satisfies ContextMessage
                 ),
                 ...[truncatedPrecedingText, truncatedFollowingText]
                     .filter(text => text.trim().length > 0)
-                    .flatMap(text =>
-                        getContextMessageWithResponse(
-                            populateCodeContextTemplate(text, uri, undefined, 'edit'),
-                            {
-                                type: 'file',
-                                uri,
-                            }
-                        )
+                    .flatMap(
+                        text =>
+                            ({
+                                speaker: 'human' as const,
+                                text: populateCodeContextTemplate(text, uri, undefined, 'edit'),
+                                file: { type: 'file', uri, source: ContextItemSource.Editor },
+                            }) satisfies ContextMessage
                     ),
             ]
         }
     }
 }
 
+const isAgentTesting = process.env.CODY_SHIM_TESTING === 'true'
+
 interface GetContextOptions extends GetContextFromIntentOptions {
-    userContextFiles: ContextFile[]
-    contextMessages?: ContextMessage[]
+    userContextItems: ContextItem[]
     editor: VSCodeEditor
-    command?: CodyCommand
 }
 
 export const getContext = async ({
-    userContextFiles,
+    userContextItems,
     editor,
-    contextMessages,
     ...options
 }: GetContextOptions): Promise<ContextItem[]> => {
-    if (contextMessages) {
-        return extractContextItemsFromContextMessages(contextMessages)
+    if (isAgentTesting) {
+        // Need deterministic ordering of context files for the tests to pass
+        // consistently across different file systems.
+        userContextItems.sort((a, b) => a.uri.path.localeCompare(b.uri.path))
     }
 
-    const derivedContextMessages = await getContextFromIntent({ editor, ...options })
-
-    const userProvidedContextMessages: ContextMessage[] = []
-    for (const file of userContextFiles) {
-        if (file.uri) {
-            const content = await editor.getTextEditorContentForFile(file.uri, file.range)
-            if (content) {
-                const message = createContextMessageByFile(file, content)
-                userProvidedContextMessages.push(...message)
-            }
-        }
-    }
-
-    return extractContextItemsFromContextMessages([
-        ...derivedContextMessages,
-        ...userProvidedContextMessages,
-    ])
+    const derivedContext = await getContextFromIntent({ editor, ...options })
+    const userContext = await resolveContextItems(editor, userContextItems, options.selectedText)
+    return [...extractContextItemsFromContextMessages(derivedContext), ...userContext]
 }

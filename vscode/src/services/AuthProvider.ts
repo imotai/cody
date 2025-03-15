@@ -1,484 +1,384 @@
-import * as vscode from 'vscode'
-
 import {
-    DOTCOM_URL,
-    LOCAL_APP_URL,
-    SourcegraphGraphQLAPIClient,
-    isDotCom,
-    isError,
-    type ConfigurationWithAccessToken,
-} from '@sourcegraph/cody-shared'
-
-import { CodyChatPanelViewType } from '../chat/chat-view/ChatManager'
-import {
-    ACCOUNT_USAGE_URL,
-    defaultAuthStatus,
-    isLoggedIn as isAuthed,
-    networkErrorAuthStatus,
-    unauthenticatedStatus,
+    type AuthCredentials,
     type AuthStatus,
-} from '../chat/protocol'
-import { newAuthStatus } from '../chat/utils'
-import { getFullConfig } from '../configuration'
-import { logDebug } from '../log'
-
-import { AuthMenu, showAccessTokenInputBox, showInstanceURLInputBox } from './AuthMenus'
+    type ClientCapabilitiesWithLegacyFields,
+    ClientConfigSingleton,
+    DOTCOM_URL,
+    EMPTY,
+    NEVER,
+    type ResolvedConfiguration,
+    type Unsubscribable,
+    abortableOperation,
+    authStatus,
+    combineLatest,
+    currentResolvedConfig,
+    disposableSubscription,
+    distinctUntilChanged,
+    clientCapabilities as getClientCapabilities,
+    isAbortError,
+    resolvedConfig as resolvedConfig_,
+    setAuthStatusObservable as setAuthStatusObservable_,
+    startWith,
+    switchMap,
+    telemetryRecorder,
+    withLatestFrom,
+} from '@sourcegraph/cody-shared'
+import { normalizeServerEndpointURL } from '@sourcegraph/cody-shared/src/configuration/auth-resolver'
+import {
+    isAvailabilityError,
+    isEnterpriseUserDotComError,
+    isInvalidAccessTokenError,
+    isNeedsAuthChallengeError,
+} from '@sourcegraph/cody-shared/src/sourcegraph-api/errors'
+import isEqual from 'lodash/isEqual'
+import { Observable, Subject, interval } from 'observable-fns'
+import * as vscode from 'vscode'
+import { serializeConfigSnapshot } from '../../uninstall/serializeConfig'
+import { type ResolvedConfigurationCredentialsOnly, validateCredentials } from '../auth/auth'
+import { logError } from '../output-channel-logger'
+import { maybeStartInteractiveTutorial } from '../tutorial/helpers'
+import { version } from '../version'
 import { localStorage } from './LocalStorageProvider'
-import { secretStorage } from './SecretStorageProvider'
-import { telemetryService } from './telemetry'
-import { telemetryRecorder } from './telemetry-v2'
 
-type Listener = (authStatus: AuthStatus) => void
-type Unsubscribe = () => void
+const HAS_AUTHENTICATED_BEFORE_KEY = 'has-authenticated-before'
 
-export class AuthProvider {
-    private endpointHistory: string[] = []
+class AuthProvider implements vscode.Disposable {
+    private status = new Subject<AuthStatus>()
+    private refreshRequests = new Subject<boolean>()
 
-    private appScheme = vscode.env.uriScheme
-    private client: SourcegraphGraphQLAPIClient | null = null
+    /**
+     * Credentials that were already validated with
+     * {@link AuthProvider.validateAndStoreCredentials}.
+     */
+    private lastValidatedAndStoredCredentials =
+        new Subject<ResolvedConfigurationCredentialsOnly | null>()
+    private lastEndpoint: string | undefined
 
-    private authStatus: AuthStatus = defaultAuthStatus
-    private listeners: Set<Listener> = new Set()
+    private hasAuthed = false
 
-    constructor(
-        private config: Pick<
-            ConfigurationWithAccessToken,
-            'serverEndpoint' | 'accessToken' | 'customHeaders'
-        >
-    ) {
-        this.authStatus.endpoint = 'init'
-        this.loadEndpointHistory()
-    }
+    private subscriptions: Unsubscribable[] = []
 
-    // Sign into the last endpoint the user was signed into, if any
-    public async init(): Promise<void> {
-        let lastEndpoint = localStorage?.getEndpoint() || this.config.serverEndpoint
-        let token = (await secretStorage.get(lastEndpoint || '')) || this.config.accessToken
-        if (lastEndpoint === LOCAL_APP_URL.toString()) {
-            // If the user last signed in to app, which talks to dotcom, try
-            // signing them in to dotcom.
-            logDebug('AuthProvider:init', 'redirecting App-signed in user to dotcom')
-            lastEndpoint = DOTCOM_URL.toString()
-            token = (await secretStorage.get(lastEndpoint)) || null
+    private async validateAndUpdateAuthStatus(
+        credentials: ResolvedConfigurationCredentialsOnly,
+        signal?: AbortSignal,
+        resetInitialAuthStatus?: boolean
+    ): Promise<void> {
+        if (resetInitialAuthStatus ?? true) {
+            // Immediately emit the unauthenticated status while we are authenticating.
+            // Emitting `authenticated: false` for a brief period is both true and a
+            // way to ensure that subscribers are robust to changes in
+            // authentication status.
+            this.status.next({
+                authenticated: false,
+                pendingValidation: true,
+                endpoint: credentials.auth.serverEndpoint,
+            })
         }
-        logDebug('AuthProvider:init:lastEndpoint', lastEndpoint)
-        await this.auth(lastEndpoint, token || null)
-    }
 
-    public addChangeListener(listener: Listener): Unsubscribe {
-        this.listeners.add(listener)
-        return () => this.listeners.delete(listener)
-    }
-
-    // Display quickpick to select endpoint to sign in to
-    public async signinMenu(type?: 'enterprise' | 'dotcom' | 'token', uri?: string): Promise<void> {
-        const mode = this.authStatus.isLoggedIn ? 'switch' : 'signin'
-        logDebug('AuthProvider:signinMenu', mode)
-        telemetryService.log('CodyVSCodeExtension:login:clicked', { hasV2Event: true })
-        telemetryRecorder.recordEvent('cody.auth.login', 'clicked')
-        const item = await AuthMenu(mode, this.endpointHistory)
-        if (!item) {
-            return
-        }
-        const menuID = type || item?.id
-        telemetryService.log('CodyVSCodeExtension:auth:selectSigninMenu', { menuID, hasV2Event: true })
-        telemetryRecorder.recordEvent('cody.auth.signin.menu', 'clicked', {
-            privateMetadata: { menuID },
-        })
-        switch (menuID) {
-            case 'enterprise': {
-                const instanceUrl = await showInstanceURLInputBox(item.uri)
-                if (!instanceUrl) {
-                    return
-                }
-                this.authStatus.endpoint = instanceUrl
-                this.redirectToEndpointLogin(instanceUrl)
-                break
-            }
-            case 'dotcom':
-                this.redirectToEndpointLogin(DOTCOM_URL.href)
-                break
-            case 'token': {
-                const instanceUrl = await showInstanceURLInputBox(uri || item.uri)
-                if (!instanceUrl) {
-                    return
-                }
-                await this.signinMenuForInstanceUrl(instanceUrl)
-                break
-            }
-            default: {
-                // Auto log user if token for the selected instance was found in secret
-                const selectedEndpoint = item.uri
-                const token = await secretStorage.get(selectedEndpoint)
-                let authStatus = await this.auth(selectedEndpoint, token || null)
-                if (!authStatus?.isLoggedIn) {
-                    const newToken = await showAccessTokenInputBox(item.uri)
-                    if (!newToken) {
-                        return
-                    }
-                    authStatus = await this.auth(selectedEndpoint, newToken || null)
-                }
-                await showAuthResultMessage(selectedEndpoint, authStatus?.authStatus)
-                logDebug('AuthProvider:signinMenu', mode, selectedEndpoint)
+        try {
+            const authStatus = await validateCredentials(credentials, signal, undefined)
+            signal?.throwIfAborted()
+            this.status.next(authStatus)
+            await this.handleAuthTelemetry(authStatus, signal)
+        } catch (error) {
+            if (!isAbortError(error)) {
+                logError('AuthProvider', 'Unexpected error validating credentials', error)
             }
         }
     }
 
-    private async signinMenuForInstanceUrl(instanceUrl: string): Promise<void> {
-        const accessToken = await showAccessTokenInputBox(instanceUrl)
-        if (!accessToken) {
-            return
-        }
-        const authState = await this.auth(instanceUrl, accessToken)
-        telemetryService.log('CodyVSCodeExtension:auth:fromToken', {
-            success: Boolean(authState?.isLoggedIn),
-            hasV2Event: true,
-        })
-        telemetryRecorder.recordEvent('cody.auth.signin.token', 'clicked', {
-            metadata: {
-                success: authState?.isLoggedIn ? 1 : 0,
-            },
-        })
-        await showAuthResultMessage(instanceUrl, authState?.authStatus)
-    }
+    constructor(setAuthStatusObservable = setAuthStatusObservable_, resolvedConfig = resolvedConfig_) {
+        setAuthStatusObservable(this.status.pipe(distinctUntilChanged()))
 
-    public async signoutMenu(): Promise<void> {
-        telemetryService.log('CodyVSCodeExtension:logout:clicked', { hasV2Event: true })
-        telemetryRecorder.recordEvent('cody.auth.logout', 'clicked')
-        const { endpoint } = this.getAuthStatus()
-
-        if (endpoint) {
-            await this.signout(endpoint)
-            logDebug('AuthProvider:signoutMenu', endpoint)
-        }
-    }
-
-    public async accountMenu(): Promise<void> {
-        if (!this.authStatus.authenticated || !this.authStatus.endpoint) {
-            return
-        }
-
-        if (!isDotCom(this.authStatus.endpoint)) {
-            const username = this.authStatus.username || this.authStatus.displayName
-            const option = await vscode.window.showInformationMessage(
-                `Signed in as @${username}`,
-                {
-                    modal: true,
-                    detail: `Enterprise Instance:\n${this.authStatus.endpoint}`,
-                },
-                'Switch Account...',
-                'Sign Out'
-            )
-            switch (option) {
-                case 'Switch Account...':
-                    await this.signinMenu()
-                    break
-                case 'Sign Out':
-                    await this.signoutMenu()
-                    break
-            }
-            return
-        }
-
-        const detail = `Plan: ${this.authStatus.userCanUpgrade ? 'Cody Free' : 'Cody Pro'}`
-        const options = ['Manage Account', 'Switch Account...', 'Sign Out']
-        const displayName = this.authStatus.displayName || this.authStatus.username
-        const email = this.authStatus.primaryEmail || 'No Email'
-        const option = await vscode.window.showInformationMessage(
-            `Signed in as ${displayName} (${email})`,
-            { modal: true, detail },
-            ...options
+        const credentialsChangesNeedingValidation = resolvedConfig.pipe(
+            withLatestFrom(this.lastValidatedAndStoredCredentials.pipe(startWith(null))),
+            switchMap(([config, lastValidatedCredentials]) => {
+                const credentials: ResolvedConfigurationCredentialsOnly =
+                    toCredentialsOnlyNormalized(config)
+                return isEqual(credentials, lastValidatedCredentials)
+                    ? NEVER
+                    : Observable.of(credentials)
+            }),
+            distinctUntilChanged()
         )
-        switch (option) {
-            case 'Manage Account':
-                void vscode.env.openExternal(vscode.Uri.parse(ACCOUNT_USAGE_URL.toString()))
-                break
-            case 'Switch Account...':
-                await this.signinMenu()
-                break
-            case 'Sign Out':
-                await this.signoutMenu()
-                break
+
+        this.subscriptions.push(
+            ClientConfigSingleton.getInstance()
+                .updates.pipe(
+                    abortableOperation(async (config, signal) => {
+                        const nextAuthStatus = await validateCredentials(
+                            await currentResolvedConfig(),
+                            signal,
+                            config
+                        )
+                        // The only case where client config impacts the auth status is when the user is
+                        // logged into dotcom but the client config is set to use an enterprise instance
+                        // we explicitly check for this error and only update if so
+                        if (
+                            !nextAuthStatus.authenticated &&
+                            isEnterpriseUserDotComError(nextAuthStatus.error)
+                        ) {
+                            this.status.next(nextAuthStatus)
+                        }
+                    })
+                )
+                .subscribe({})
+        )
+
+        // Perform auth as config changes.
+        this.subscriptions.push(
+            combineLatest(
+                credentialsChangesNeedingValidation,
+                this.refreshRequests.pipe(startWith(true))
+            )
+                .pipe(
+                    abortableOperation(async ([config, resetInitialAuthStatus], signal) => {
+                        if (getClientCapabilities().isCodyWeb) {
+                            // Cody Web calls {@link AuthProvider.validateAndStoreCredentials}
+                            // explicitly. This early exit prevents duplicate authentications during
+                            // the initial load.
+                            return
+                        }
+                        await this.validateAndUpdateAuthStatus(config, signal, resetInitialAuthStatus)
+                    })
+                )
+                .subscribe({})
+        )
+
+        // Try to reauthenticate periodically when the authentication failed due to an availability
+        // error (which is ephemeral and the underlying error condition may no longer exist).
+        this.subscriptions.push(
+            authStatus
+                .pipe(
+                    switchMap(authStatus => {
+                        if (!authStatus.authenticated && isNeedsAuthChallengeError(authStatus.error)) {
+                            // This interval is short because we want to quickly authenticate after
+                            // the user successfully performs the auth challenge. If automatic auth
+                            // refresh is expanded to include other conditions (such as any network
+                            // connectivity gaps), it should probably have a longer interval, and we
+                            // need to respect
+                            // https://linear.app/sourcegraph/issue/CODY-3745/codys-background-periodic-network-access-causes-2fa.
+                            const intervalMsec = 2500
+                            return interval(intervalMsec)
+                        }
+                        return EMPTY
+                    })
+                )
+                .subscribe(() => {
+                    this.refreshRequests.next(false)
+                })
+        )
+
+        // Keep context updated with auth status.
+        this.subscriptions.push(
+            authStatus.subscribe(authStatus => {
+                try {
+                    this.lastEndpoint = authStatus.endpoint
+                    vscode.commands.executeCommand('authStatus.update', authStatus)
+                    vscode.commands.executeCommand(
+                        'setContext',
+                        'cody.activated',
+                        authStatus.authenticated
+                    )
+                    vscode.commands.executeCommand(
+                        'setContext',
+                        'cody.serverEndpoint',
+                        authStatus.endpoint
+                    )
+                } catch (error) {
+                    logError('AuthProvider', 'Unexpected error while setting context', error)
+                }
+            })
+        )
+
+        // Report auth changes.
+        this.subscriptions.push(startAuthTelemetryReporter())
+
+        this.subscriptions.push(
+            disposableSubscription(
+                vscode.commands.registerCommand('cody.auth.refresh', () => this.refresh())
+            )
+        )
+    }
+
+    private async handleAuthTelemetry(authStatus: AuthStatus, signal?: AbortSignal): Promise<void> {
+        // If the extension is authenticated on startup, it can't be a user's first
+        // ever authentication. We store this to prevent logging first-ever events
+        // for already existing users.
+        const hasAuthed = this.hasAuthed
+        this.hasAuthed = true
+        if (!hasAuthed && authStatus.authenticated) {
+            await this.setHasAuthenticatedBefore()
+            signal?.throwIfAborted()
+        } else if (authStatus.authenticated) {
+            this.handleFirstEverAuthentication()
         }
     }
 
-    // Log user out of the selected endpoint (remove token from secret)
-    private async signout(endpoint: string): Promise<void> {
-        await secretStorage.deleteToken(endpoint)
-        await localStorage.deleteEndpoint()
-        await this.auth(endpoint, null)
-        this.authStatus.endpoint = ''
-        await vscode.commands.executeCommand('setContext', CodyChatPanelViewType, false)
-        await vscode.commands.executeCommand('setContext', 'cody.activated', false)
+    public dispose(): void {
+        for (const subscription of this.subscriptions) {
+            subscription.unsubscribe()
+        }
     }
 
-    // Create Auth Status
-    private async makeAuthStatus(
-        config: Pick<ConfigurationWithAccessToken, 'serverEndpoint' | 'accessToken' | 'customHeaders'>
+    /**
+     * Refresh the auth status.
+     */
+    public refresh(resetInitialAuthStatus = true): void {
+        this.lastValidatedAndStoredCredentials.next(null)
+        this.refreshRequests.next(resetInitialAuthStatus)
+    }
+
+    public signout(endpoint: string): void {
+        if (this.lastEndpoint !== endpoint) {
+            return
+        }
+        this.lastValidatedAndStoredCredentials.next(null)
+        this.status.next({
+            authenticated: false,
+            endpoint: DOTCOM_URL.toString(),
+            pendingValidation: false,
+        })
+    }
+
+    public async validateAndStoreCredentials(
+        config: ResolvedConfigurationCredentialsOnly | AuthCredentials,
+        mode: 'store-if-valid' | 'always-store'
     ): Promise<AuthStatus> {
-        const endpoint = config.serverEndpoint
-        const token = config.accessToken
-        if (!token || !endpoint) {
-            return { ...defaultAuthStatus, endpoint }
-        }
-        // Cache the config and the GraphQL client
-        if (this.config !== config || !this.client) {
-            this.config = config
-            this.client = new SourcegraphGraphQLAPIClient(config)
-        }
-        // Version is for frontend to check if Cody is not enabled due to unsupported version when siteHasCodyEnabled is false
-        const [{ enabled, version }, codyLLMConfiguration] = await Promise.all([
-            this.client.isCodyEnabled(),
-            this.client.getCodyLLMConfiguration(),
-        ])
-
-        const configOverwrites = isError(codyLLMConfiguration) ? undefined : codyLLMConfiguration
-
-        const isDotCom = this.client.isDotCom()
-        const userInfo = await this.client.getCurrentUserInfo()
-
-        if (!isDotCom) {
-            const hasVerifiedEmail = false
-
-            // check first if it's a network error
-            if (isError(userInfo)) {
-                if (isNetworkError(userInfo)) {
-                    return { ...networkErrorAuthStatus, endpoint }
-                }
-                return { ...unauthenticatedStatus, endpoint }
-            }
-
-            return newAuthStatus(
-                endpoint,
-                isDotCom,
-                !isError(userInfo),
-                hasVerifiedEmail,
-                enabled,
-                /* userCanUpgrade: */ false,
-                version,
-                userInfo.avatarURL,
-                userInfo.username,
-                userInfo.displayName,
-                userInfo.primaryEmail?.email,
-                configOverwrites
-            )
+        let credentials: ResolvedConfigurationCredentialsOnly
+        if ('auth' in config) {
+            credentials = toCredentialsOnlyNormalized(config)
+        } else {
+            const prevConfig = await currentResolvedConfig()
+            credentials = toCredentialsOnlyNormalized({
+                configuration: prevConfig.configuration,
+                auth: config,
+                clientState: prevConfig.clientState,
+            })
         }
 
-        const isCodyEnabled = true
-        const proStatus = await this.client.getCurrentUserCodyProEnabled()
-
-        // check first if it's a network error
-        if (isError(userInfo)) {
-            if (isNetworkError(userInfo)) {
-                return { ...networkErrorAuthStatus, endpoint }
-            }
-            return { ...unauthenticatedStatus, endpoint }
+        const authStatus = await validateCredentials(credentials, undefined)
+        const shouldStore = mode === 'always-store' || authStatus.authenticated
+        if (shouldStore) {
+            await Promise.all([
+                localStorage.saveEndpointAndToken(credentials.auth),
+                this.serializeUninstallerInfo(authStatus),
+            ])
+            this.lastValidatedAndStoredCredentials.next(credentials)
+            this.status.next(authStatus)
         }
-        const userCanUpgrade =
-            isDotCom &&
-            'codyProEnabled' in proStatus &&
-            typeof proStatus.codyProEnabled === 'boolean' &&
-            !proStatus.codyProEnabled
-
-        return newAuthStatus(
-            endpoint,
-            isDotCom,
-            !!userInfo.id,
-            userInfo.hasVerifiedEmail,
-            isCodyEnabled,
-            userCanUpgrade,
-            version,
-            userInfo.avatarURL,
-            userInfo.username,
-            userInfo.displayName,
-            userInfo.primaryEmail?.email,
-            configOverwrites
-        )
+        if (!shouldStore) {
+            // Always report telemetry even if we don't store it.
+            reportAuthTelemetryEvent(authStatus)
+        }
+        await this.handleAuthTelemetry(authStatus, undefined)
+        return authStatus
     }
 
-    public getAuthStatus(): AuthStatus {
-        return this.authStatus
+    public setAuthPendingToEndpoint(endpoint: string): void {
+        // TODO(sqs)#observe: store this pending endpoint in clientState instead of authStatus
+        this.status.next({ authenticated: false, endpoint, pendingValidation: true })
     }
 
-    // It processes the authentication steps and stores the login info before sharing the auth status with chatview
-    public async auth(
-        uri: string,
-        token: string | null,
-        customHeaders?: Record<string, string> | null
-    ): Promise<{ authStatus: AuthStatus; isLoggedIn: boolean }> {
-        const endpoint = formatURL(uri) || ''
-        const config = {
-            serverEndpoint: endpoint,
-            accessToken: token,
-            customHeaders: customHeaders || this.config.customHeaders,
-        }
-        const authStatus = await this.makeAuthStatus(config)
-        const isLoggedIn = isAuthed(authStatus)
-        authStatus.isLoggedIn = isLoggedIn
-        await this.storeAuthInfo(endpoint, token)
-        this.syncAuthStatus(authStatus)
-        await vscode.commands.executeCommand('setContext', 'cody.activated', isLoggedIn)
-        return { authStatus, isLoggedIn }
-    }
-
-    // Set auth status in case of reload
-    public async reloadAuthStatus(): Promise<void> {
-        this.config = await getFullConfig()
-        await this.auth(this.config.serverEndpoint, this.config.accessToken, this.config.customHeaders)
-    }
-
-    // Set auth status and share it with chatview
-    private syncAuthStatus(authStatus: AuthStatus): void {
-        if (this.authStatus === authStatus) {
+    // Logs a telemetry event if the user has never authenticated to Sourcegraph.
+    private handleFirstEverAuthentication(): void {
+        if (localStorage.get(HAS_AUTHENTICATED_BEFORE_KEY)) {
+            // User has authenticated before, noop
             return
         }
-        this.authStatus = authStatus
-        this.announceNewAuthStatus()
-    }
-
-    public announceNewAuthStatus(): void {
-        if (this.authStatus.endpoint === 'init') {
-            return
-        }
-        const authStatus = this.getAuthStatus()
-        for (const listener of this.listeners) {
-            listener(authStatus)
-        }
-    }
-
-    // Register URI Handler (vscode://sourcegraph.cody-ai) for resolving token
-    // sending back from sourcegraph.com
-    public async tokenCallbackHandler(
-        uri: vscode.Uri,
-        customHeaders: Record<string, string>
-    ): Promise<void> {
-        const params = new URLSearchParams(uri.query)
-        const token = params.get('code')
-        const endpoint = this.authStatus.endpoint
-        if (!token || !endpoint) {
-            return
-        }
-        const authState = await this.auth(endpoint, token, customHeaders)
-        telemetryService.log('CodyVSCodeExtension:auth:fromCallback', {
-            type: 'callback',
-            from: 'web',
-            success: Boolean(authState?.isLoggedIn),
-            hasV2Event: true,
-        })
-        telemetryRecorder.recordEvent('cody.auth.fromCallback.web', 'succeeded', {
-            metadata: {
-                success: authState?.isLoggedIn ? 1 : 0,
+        telemetryRecorder.recordEvent('cody.auth.login', 'firstEver', {
+            billingMetadata: {
+                product: 'cody',
+                category: 'billable',
             },
         })
-        if (authState?.isLoggedIn) {
-            await vscode.window.showInformationMessage(`Signed in to ${endpoint}`)
-        } else {
-            await showAuthFailureMessage(endpoint)
-        }
+        this.setHasAuthenticatedBefore()
+        void maybeStartInteractiveTutorial()
     }
 
-    /** Open callback URL in browser to get token from instance. */
-    public redirectToEndpointLogin(uri: string): void {
-        const endpoint = formatURL(uri)
-        if (!endpoint) {
-            return
-        }
-
-        if (vscode.env.uiKind === vscode.UIKind.Web) {
-            // VS Code Web needs a different kind of callback using asExternalUri and changes to our
-            // UserSettingsCreateAccessTokenCallbackPage.tsx page in the Sourcegraph web app. So,
-            // just require manual token entry for now.
-            const newTokenNoCallbackUrl = new URL('/user/settings/tokens/new', endpoint)
-            void vscode.env.openExternal(vscode.Uri.parse(newTokenNoCallbackUrl.href))
-            void this.signinMenuForInstanceUrl(endpoint)
-            return
-        }
-
-        const newTokenCallbackUrl = new URL('/user/settings/tokens/new/callback', endpoint)
-        newTokenCallbackUrl.searchParams.append(
-            'requestFrom',
-            this.appScheme === 'vscode-insiders' ? 'CODY_INSIDERS' : 'CODY'
-        )
-        this.authStatus.endpoint = endpoint
-        void vscode.env.openExternal(vscode.Uri.parse(newTokenCallbackUrl.href))
+    private setHasAuthenticatedBefore() {
+        return localStorage.set(HAS_AUTHENTICATED_BEFORE_KEY, 'true')
     }
 
-    // Refresh current endpoint history with the one from local storage
-    private loadEndpointHistory(): void {
-        this.endpointHistory = localStorage.getEndpointHistory() || []
-    }
-
-    // Store endpoint in local storage, token in secret storage, and update endpoint history
-    private async storeAuthInfo(
-        endpoint: string | null | undefined,
-        token: string | null | undefined
-    ): Promise<void> {
-        if (!endpoint) {
-            return
+    // When the auth status is updated, we serialize the current configuration to disk,
+    // so that it can be sent with Telemetry when the post-uninstall script runs.
+    // we only write on auth change as that is the only significantly important factor
+    // and we don't want to write too frequently (so we don't react to config changes)
+    // The vscode API is not available in the post-uninstall script.
+    // Public so that it can be mocked for testing
+    public async serializeUninstallerInfo(authStatus: AuthStatus): Promise<void> {
+        if (!authStatus.authenticated) return
+        let clientCapabilities: ClientCapabilitiesWithLegacyFields | undefined
+        try {
+            clientCapabilities = getClientCapabilities()
+        } catch {
+            // If client capabilities cannot be retrieved, we will just synthesize
+            // them from defaults in the post-uninstall script.
         }
-        await localStorage.saveEndpoint(endpoint)
-        if (token) {
-            await secretStorage.storeToken(endpoint, token)
+        // TODO: put this behind a proper client capability if any other IDE's need to uninstall
+        // the same way as VSCode (most editors have a proper uninstall hook)
+        if (clientCapabilities?.isVSCode) {
+            const config = localStorage.getConfig() ?? (await currentResolvedConfig())
+            await serializeConfigSnapshot({
+                config,
+                authStatus,
+                clientCapabilities,
+                version,
+            })
         }
-        this.loadEndpointHistory()
-    }
-
-    // Notifies the AuthProvider that the simplified onboarding experiment is
-    // kicking off an authorization flow. That flow ends when (if) this
-    // AuthProvider gets a call to tokenCallbackHandler.
-    public authProviderSimplifiedWillAttemptAuth(): void {
-        // FIXME: This is equivalent to what redirectToEndpointLogin does. But
-        // the existing design is weak--it mixes other authStatus with this
-        // endpoint and races with everything else this class does.
-
-        // Simplified onboarding only supports dotcom.
-        this.authStatus.endpoint = DOTCOM_URL.toString()
     }
 }
 
-export function isNetworkError(error: Error): boolean {
-    const message = error.message
-    return (
-        message.includes('ENOTFOUND') ||
-        message.includes('ECONNREFUSED') ||
-        message.includes('ECONNRESET') ||
-        message.includes('EHOSTUNREACH')
-    )
+export const authProvider = new AuthProvider()
+
+/**
+ * @internal For testing only.
+ */
+export function newAuthProviderForTest(
+    ...args: ConstructorParameters<typeof AuthProvider>
+): AuthProvider {
+    return new AuthProvider(...args)
 }
 
-function formatURL(uri: string): string | null {
-    if (!uri) {
-        return null
-    }
-    // Check if the URI is in the correct URL format
-    // Add missing https:// if needed
-    if (!uri.startsWith('http')) {
-        uri = `https://${uri}`
-    }
-    try {
-        const endpointUri = new URL(uri)
-        return endpointUri.href
-    } catch {
-        console.error('Invalid URL')
-    }
-    return null
+function startAuthTelemetryReporter(): Unsubscribable {
+    return authStatus.subscribe(authStatus => {
+        reportAuthTelemetryEvent(authStatus)
+    })
 }
 
-async function showAuthResultMessage(
-    endpoint: string,
-    authStatus: AuthStatus | undefined
-): Promise<void> {
-    if (authStatus?.isLoggedIn) {
-        const authority = vscode.Uri.parse(endpoint).authority
-        await vscode.window.showInformationMessage(`Signed in to ${authority || endpoint}`)
+function reportAuthTelemetryEvent(authStatus: AuthStatus): void {
+    if (authStatus.pendingValidation) {
+        return // Not a valid event to report.
+    }
+    let eventValue: 'disconnected' | 'connected' | 'failed'
+    if (
+        !authStatus.authenticated &&
+        (isAvailabilityError(authStatus.error) || isInvalidAccessTokenError(authStatus.error))
+    ) {
+        eventValue = 'failed'
+    } else if (authStatus.authenticated) {
+        eventValue = 'connected'
     } else {
-        await showAuthFailureMessage(endpoint)
+        eventValue = 'disconnected'
     }
+    telemetryRecorder.recordEvent('cody.auth', eventValue, {
+        billingMetadata:
+            eventValue === 'connected'
+                ? {
+                      product: 'cody',
+                      category: 'billable',
+                  }
+                : undefined,
+    })
 }
-
-async function showAuthFailureMessage(endpoint: string): Promise<void> {
-    const authority = vscode.Uri.parse(endpoint).authority
-    await vscode.window.showErrorMessage(
-        `Authentication failed. Please ensure Cody is enabled for ${authority} and verify your email address if required.`
-    )
+function toCredentialsOnlyNormalized(
+    config: ResolvedConfiguration | ResolvedConfigurationCredentialsOnly
+): ResolvedConfigurationCredentialsOnly {
+    return {
+        configuration: {
+            customHeaders: config.configuration.customHeaders,
+        },
+        auth: { ...config.auth, serverEndpoint: normalizeServerEndpointURL(config.auth.serverEndpoint) },
+        clientState: { anonymousUserID: config.clientState.anonymousUserID },
+    }
 }

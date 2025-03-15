@@ -1,6 +1,6 @@
 import * as vscode from 'vscode'
 
-import { isCodyIgnoredFile } from '@sourcegraph/cody-shared'
+import { SUPPORTED_URI_SCHEMAS } from '@sourcegraph/cody-shared'
 
 /**
  * Interface for tracking the last active text editor that is not a webview panel for
@@ -9,8 +9,11 @@ import { isCodyIgnoredFile } from '@sourcegraph/cody-shared'
  * active: The current valid active/supported text editor instance.
  * ignored: Whether the active editor is ignored by Cody or not.
  */
-interface LastActiveTextEditor {
+export interface LastActiveTextEditor {
     active?: vscode.TextEditor
+    /**
+     * @deprecated Cody Ignore has been deprecated. This field will be removed in the future.
+     */
     ignored?: boolean
 }
 
@@ -33,9 +36,6 @@ export function resetActiveEditor(): void {
     lastActiveTextEditor = { active: undefined, ignored: false }
 }
 
-// Support file, untitled, and notebooks
-const validFileSchemes = new Set(['file', 'untitled', 'vscode-notebook', 'vscode-notebook-cell'])
-
 // When the webview panel is focused, calling activeTextEditor will return undefined.
 // This allows us to keep using the last active editor before the webview panel became the active editor
 export function getEditor(): LastActiveTextEditor {
@@ -55,9 +55,8 @@ export function getEditor(): LastActiveTextEditor {
         const activeEditor = vscode.window.activeTextEditor || vscode.window.visibleTextEditors[0]
         if (activeEditor?.document.uri.scheme) {
             // Update the lastActiveTextEditor if the active editor is a valid file
-            if (validFileSchemes.has(activeEditor.document.uri.scheme)) {
+            if (SUPPORTED_URI_SCHEMAS.has(activeEditor.document.uri.scheme)) {
                 lastActiveTextEditor.active = activeEditor
-                lastActiveTextEditor.ignored = isCodyIgnoredFile(activeEditor?.document.uri)
             }
         }
         return lastActiveTextEditor

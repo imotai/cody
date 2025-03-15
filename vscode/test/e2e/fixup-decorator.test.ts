@@ -1,22 +1,10 @@
 import { expect } from '@playwright/test'
 
-import { loggedEvents, resetLoggedEvents } from '../fixtures/mock-server'
-
 import { sidebarExplorer, sidebarSignin } from './common'
-import { assertEvents, test } from './helpers'
+import { test } from './helpers'
 
 const DECORATION_SELECTOR =
     'div.view-overlays[role="presentation"] div[class*="TextEditorDecorationType"]'
-
-const expectedEvents = [
-    'CodyVSCodeExtension:command:edit:executed',
-    'CodyVSCodeExtension:keywordContext:searchDuration',
-    'CodyVSCodeExtension:fixupResponse:hasCode',
-]
-
-test.beforeEach(() => {
-    resetLoggedEvents()
-})
 
 // TODO: Fix flaky test due to typewriter delay: https://github.com/sourcegraph/cody/pull/1578
 test.skip('decorations from un-applied Cody changes appear', async ({ page, sidebar }) => {
@@ -45,7 +33,7 @@ test.skip('decorations from un-applied Cody changes appear', async ({ page, side
     await page.keyboard.press('ArrowDown')
 
     // Open the command palette by clicking on the Cody Icon
-    await page.getByRole('button', { name: 'Commands' }).click()
+    await page.getByRole('button', { name: 'Cody Commands' }).click()
     // Navigate to fixup input
     await page.getByRole('option', { name: 'Edit code' }).click()
 
@@ -73,5 +61,4 @@ test.skip('decorations from un-applied Cody changes appear', async ({ page, side
 
     // The decorations should change to conflict markers.
     await page.waitForSelector(`${DECORATION_SELECTOR}:not([class*="${decorationClassName}"])`)
-    await assertEvents(loggedEvents, expectedEvents)
 })

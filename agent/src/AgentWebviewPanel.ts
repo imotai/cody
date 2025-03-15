@@ -1,23 +1,33 @@
 import * as uuid from 'uuid'
 import type * as vscode from 'vscode'
 
-import type { ModelProvider } from '@sourcegraph/cody-shared'
-
 import type { ExtensionMessage, WebviewMessage } from '../../vscode/src/chat/protocol'
 
-import { defaultWebviewPanel, EventEmitter } from './vscode-shim'
-import type { Repo } from '../../vscode/src/context/repo-fetcher'
+import {
+    type WebviewToExtensionAPI,
+    createExtensionAPI,
+    createMessageAPIForWebview,
+} from '@sourcegraph/cody-shared'
+import { EventEmitter, defaultWebviewPanel } from './vscode-shim'
 
-/** Utility class to manage a list of `AgentWebPanel` instances. */
+/** Utility class to manage a list of `AgentWebPanel` or "native" WebviewPanel instances. */
 export class AgentWebviewPanels {
     public panels = new Map<string, AgentWebviewPanel>()
+    // TODO: If we don't create AgentWebviewPanels when using native webviews, untangle nativePanels from this type.
+    public readonly nativePanels = new Map<
+        string,
+        { didReceiveMessage: (message: any) => void; didDispose: () => void }
+    >()
     public add(panel: AgentWebviewPanel): void {
         this.panels.set(panel.panelID, panel)
+        panel.onDidDispose(() => {
+            this.panels.delete(panel.panelID)
+        })
     }
     public getPanelOrError(id: string): AgentWebviewPanel {
         const result = this.panels.get(id)
         if (!result) {
-            throw new Error(`No panel with ID${id}`)
+            throw new Error(`No panel with ID ${id}`)
         }
         return result
     }
@@ -39,8 +49,6 @@ interface AttributionResult {
 export class AgentWebviewPanel implements vscode.WebviewPanel {
     public panelID = uuid.v4()
     public chatID: string | undefined // also known as `sessionID` in some parts of the Cody codebase
-    public models: ModelProvider[] | undefined
-    public remoteRepos: Repo[] | undefined
     public isInitialized = false
     public isMessageInProgress: undefined | boolean
     // Event that fires whenever the `isMessageInProgress` value changes from the `type: 'transcript'` message.
@@ -134,6 +142,25 @@ export class AgentWebviewPanel implements vscode.WebviewPanel {
     public get onDidChangeViewState(): vscode.Event<vscode.WebviewPanelOnDidChangeViewStateEvent> {
         return this.panel.onDidChangeViewState
     }
+
+    /**
+     * Call an extension host API exposed to the "webview". See {@link WebviewToExtensionAPI}.
+     */
+    public get extensionAPI(): WebviewToExtensionAPI {
+        if (!this._extensionAPI) {
+            this._extensionAPI = createExtensionAPI(
+                createMessageAPIForWebview({
+                    postMessage: message => this.receiveMessage.fire(message),
+                    onMessage: callback => {
+                        const disposable = this.onDidPostMessage(callback)
+                        return () => disposable.dispose()
+                    },
+                })
+            )
+        }
+        return this._extensionAPI
+    }
+    private _extensionAPI: WebviewToExtensionAPI | undefined
 
     public reveal(): void {
         this.panel.reveal()
